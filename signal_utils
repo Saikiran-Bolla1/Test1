@@ -1,0 +1,196 @@
+import numpy as np
+from typing import Optional, List
+
+def gettimestampbyvalue(signal_view, value: float) -> Optional[float]:
+    """
+    Returns the timestamp where the signal crosses a given value.
+    If the value is exactly present, returns the first occurrence.
+    Otherwise, linearly interpolates between points around the crossing.
+    """
+    x = signal_view.x
+    y = signal_view.y
+    if len(y) < 2 or value < min(y) or value > max(y):
+        return None
+    indices = np.where(np.diff(np.sign(y - value)) != 0)[0]
+    if len(indices) == 0:
+        # No crossing, check for exact match
+        exact = np.where(y == value)[0]
+        if len(exact) > 0:
+            return float(x[exact[0]])
+        return None
+    i = indices[0]
+    x0, x1 = x[i], x[i+1]
+    y0, y1 = y[i], y[i+1]
+    if y1 == y0:
+        return float(x0)
+    # Linear interpolation for crossing time
+    t = x0 + (x1 - x0) * (value - y0) / (y1 - y0)
+    return float(t)
+
+def getvaluebytimestamp(signal_view, timestamp: float) -> Optional[float]:
+    """
+    Returns the signal value at a given timestamp.
+    If the timestamp is exactly present, returns the value.
+    Otherwise, linearly interpolates the value between the two closest timestamps.
+    """
+    x = signal_view.x
+    y = signal_view.y
+    if len(x) < 2 or timestamp < min(x) or timestamp > max(x):
+        return None
+    indices = np.where(np.diff(np.sign(x - timestamp)) != 0)[0]
+    if len(indices) == 0:
+        # No crossing, check for exact match
+        exact = np.where(x == timestamp)[0]
+        if len(exact) > 0:
+            return float(y[exact[0]])
+        return None
+    i = indices[0]
+    x0, x1 = x[i], x[i+1]
+    y0, y1 = y[i], y[i+1]
+    if x1 == x0:
+        return float(y0)
+    # Linear interpolation for value at timestamp
+    v = y0 + (y1 - y0) * (timestamp - x0) / (x1 - x0)
+    return float(v)
+
+def find_edge_times(signal_view, value: float, edge: str = "rising", atol: float = 1e-8) -> np.ndarray:
+    """
+    Finds all timestamps where the signal crosses a given value with either a rising or falling edge.
+    - edge: "rising" for below-to-above, "falling" for above-to-below.
+    Returns a numpy array of crossing times (using linear interpolation).
+    """
+    x = signal_view.x
+    y = signal_view.y
+    if len(x) < 2:
+        return np.array([])
+    above = y > value + atol
+    below = y < value - atol
+    on = np.isclose(y, value, atol=atol)
+    if edge == "rising":
+        # Rising: from below to above or exactly on value
+        mask = (below[:-1] & (above[1:] | on[1:]))
+    elif edge == "falling":
+        # Falling: from above to below or exactly on value
+        mask = (above[:-1] & (below[1:] | on[1:]))
+    else:
+        raise ValueError("edge must be 'rising' or 'falling'")
+    idxs = np.where(mask)[0]
+    times = []
+    for i in idxs:
+        x0, x1 = x[i], x[i+1]
+        y0, y1 = y[i], y[i+1]
+        if y1 == y0:
+            t_cross = x0
+        else:
+            # Linear interpolation for crossing time
+            t_cross = x0 + (x1 - x0) * (value - y0) / (y1 - y0)
+        times.append(t_cross)
+    return np.array(times)
+
+def time_between_signals(
+    signal_view1,
+    signal_view2,
+    value1: float,
+    value2: float,
+    edge1: str = "rising",
+    edge2: str = "rising",
+    atol1: float = 1e-8,
+    atol2: float = 1e-8
+) -> Optional[float]:
+    """
+    Returns the absolute time difference between the first (or last) edge crossing in 
+    signal_view1 and signal_view2 at the specified values and edge directions.
+    - edge: "rising" uses first occurrence, "falling" uses last occurrence.
+    Returns None if either crossing is not found.
+    """
+    times1 = find_edge_times(signal_view1, value1, edge1, atol1)
+    times2 = find_edge_times(signal_view2, value2, edge2, atol2)
+    if len(times1) == 0 or len(times2) == 0:
+        return None
+    t1 = times1[0] if edge1 == "rising" else times1[-1]
+    t2 = times2[0] if edge2 == "rising" else times2[-1]
+    return float(abs(t2 - t1))
+
+def find_persistent_value(signal_view, value: float, atol: float = 1e-8) -> Optional[float]:
+    """
+    Returns the timestamp at which the signal becomes (and remains) at the given value 
+    for all subsequent samples. Useful for fault detection when the signal 'locks' to a fault value.
+    Returns None if no such persistent value is found.
+    """
+    x = signal_view.x
+    y = signal_view.y
+    for i in range(len(y)):
+        if np.all(np.isclose(y[i:], value, atol=atol)):
+            return float(x[i])
+    return None
+
+def find_pattern(signal_view, pattern: List[float], atol: float = 1e-8) -> Optional[float]:
+    """
+    Finds the first timestamp where the signal matches a sequence of values in 'pattern'.
+    Returns the timestamp at the start of the match or None if not found.
+    Example: If pattern=[2,3,5,0], returns timestamp where signal shows these values consecutively.
+    """
+    y = signal_view.y
+    x = signal_view.x
+    n = len(pattern)
+    if len(y) < n:
+        return None
+    # Use np.isclose for floating point comparison
+    for i in range(len(y) - n + 1):
+        if np.all(np.isclose(y[i:i+n], pattern, atol=atol)):
+            return float(x[i])
+    return None
+
+def evaluate_signal_trend(signal_view, sample_count: int = 1) -> List[str]:
+    """
+    Evaluates the signal's trend (incrementing, decrementing, or unchanged) 
+    for each 'sample_count' samples.
+    Returns a list of trend strings: 'increasing', 'decreasing', or 'unchanged'.
+    Default sample_count = 1 (compare each sample to the next sample).
+    If sample_count > 1, compares every sample_count'th interval.
+    Example: For sample_count=4, compares y[0] to y[4], y[1] to y[5], etc.
+    """
+    y = signal_view.y
+    trends = []
+    N = len(y)
+    if sample_count < 1 or N <= sample_count:
+        return trends
+    for i in range(N - sample_count):
+        diff = y[i + sample_count] - y[i]
+        if np.isclose(diff, 0):
+            trends.append('unchanged')
+        elif diff > 0:
+            trends.append('increasing')
+        else:
+            trends.append('decreasing')
+    return trends
+
+def find_signal_status(signal_view, check_type: str = "stuck", atol: float = 1e-8):
+    """
+    Checks if the signal is 'stuck' (stopped updating and remains at a constant value) or 'updating' (continuously changing).
+    Arguments:
+        signal_view: object with .x and .y arrays.
+        check_type: "stuck" to find when the signal stops and gets stuck, "updating" to confirm continuous change.
+        atol: tolerance for checking stuck value (default: 1e-8).
+    Returns:
+        If check_type == "stuck":
+            (value, timestamp): value at which signal gets stuck and the timestamp when it starts being stuck.
+            Returns None if signal never gets stuck.
+        If check_type == "updating":
+            True if signal is continuously updating (never stuck), False otherwise.
+    """
+    x = signal_view.x
+    y = signal_view.y
+    N = len(y)
+    # Check where signal becomes stuck for all subsequent samples
+    for i in range(N):
+        if np.all(np.isclose(y[i:], y[i], atol=atol)):
+            if check_type == "stuck":
+                return float(y[i]), float(x[i])
+            elif check_type == "updating":
+                return False
+    # If signal never gets stuck
+    if check_type == "stuck":
+        return None
+    elif check_type == "updating":
+        return True
