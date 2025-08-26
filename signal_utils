@@ -193,24 +193,29 @@ def find_signal_status(signal_view, check_type: str = "stuck", atol: float = 1e-
     if check_type == "stuck":
         return None
     elif check_type == "updating":
-  import numpy as np
+      return True
 
-def scale_rec_signal(rec, key, factor=1.0, offset=0.0, round_to=None, clip=None):
+import numpy as np
+
+def scale_rec_signal(view, factor=1.0, offset=0.0, round_to=None, clip=None):
     """
-    In-place scale of a recorded signal so that subsequent rec[key].y returns y' = y*factor + offset.
+    In-place scale when you pass ONLY the recorded view, e.g.:
+      scale_rec_signal(rec["Device:Signal"], factor=2.0, offset=0.5)
+
+    This updates the same object that rec["Device:Signal"] returns, so future
+    accesses to rec["Device:Signal"].y reflect the new scaling.
 
     Parameters:
-    - rec: RecorderResult instance (from your session.recorder(...))
-    - key: "Device:Signal" string or CanapeVariable (anything accepted by rec[key])
+    - view: the _SignalView returned by rec["Device:Signal"]
     - factor: multiplicative factor
     - offset: additive offset
     - round_to: optional int, decimals to round to
     - clip: optional (min, max) tuple to clamp the result
 
     Returns:
-    - The same _SignalView object with its data updated.
+    - The same view object with its data updated.
     """
-    view = rec[key]  # resolve to the _SignalView
+    # Compute scaled values
     y = np.asarray(view.y, dtype=float) * float(factor) + float(offset)
 
     if round_to is not None:
@@ -219,16 +224,17 @@ def scale_rec_signal(rec, key, factor=1.0, offset=0.0, round_to=None, clip=None)
         lo, hi = clip
         y = np.clip(y, lo, hi)
 
-    # Update underlying storage so future rec[key] uses the scaled data
+    # Update underlying storage so future rec["Device:Signal"] uses the scaled data
     if hasattr(view, "_y"):
         view._y = y
     else:
-        # Fallback: if implementation changes, try best-effort replace
+        # Fallback: try to update via the public y array
         try:
-            # If y is writeable, try in-place update
             view.y[:] = y
-        except Exception:
-            raise AttributeError("Cannot update signal data in place for this RecorderResult implementation.")
+        except Exception as exc:
+            raise AttributeError(
+                "Cannot update signal data in place for this RecorderResult implementation."
+            ) from exc
 
-    return view      return True
+    return view
 
