@@ -53,19 +53,21 @@ def getvaluebytimestamp(signal_view, timestamp: float) -> Optional[float]:
     v = y0 + (y1 - y0) * (timestamp - x0) / (x1 - x0)
     return float(v)
 
-def find_edge_times(signal_view, value: float, edge: str = "rising", atol: float = 1e-8) -> np.ndarray:
+def find_edge_times(signal_view, value: float, edge: str = "rising", atol: float = 1e-8) -> float:
     """
-    Finds all timestamps where the signal crosses a given value with either a rising or falling edge.
+    Finds the first timestamp where the signal crosses a given value with either a rising or falling edge.
     - edge: "rising" for below-to-above, "falling" for above-to-below.
-    Returns a numpy array of crossing times (using linear interpolation).
+    Returns a Python float crossing time (using linear interpolation), or NaN if no crossing is found.
     """
     x = signal_view.x
     y = signal_view.y
     if len(x) < 2:
-        return np.array([])
+        return float('nan')
+
     above = y > value + atol
     below = y < value - atol
     on = np.isclose(y, value, atol=atol)
+
     if edge == "rising":
         # Rising: from below to above or exactly on value
         mask = (below[:-1] & (above[1:] | on[1:]))
@@ -74,18 +76,22 @@ def find_edge_times(signal_view, value: float, edge: str = "rising", atol: float
         mask = (above[:-1] & (below[1:] | on[1:]))
     else:
         raise ValueError("edge must be 'rising' or 'falling'")
+
     idxs = np.where(mask)[0]
-    times = []
-    for i in idxs:
-        x0, x1 = x[i], x[i+1]
-        y0, y1 = y[i], y[i+1]
-        if y1 == y0:
-            t_cross = x0
-        else:
-            # Linear interpolation for crossing time
-            t_cross = x0 + (x1 - x0) * (value - y0) / (y1 - y0)
-        times.append(t_cross)
-    return np.array(times)
+    if idxs.size == 0:
+        return float('nan')
+
+    i = int(idxs[0])  # take the first crossing
+    x0, x1 = x[i], x[i + 1]
+    y0, y1 = y[i], y[i + 1]
+
+    if y1 == y0:
+        t_cross = x0
+    else:
+        # Linear interpolation for crossing time
+        t_cross = x0 + (x1 - x0) * (value - y0) / (y1 - y0)
+
+    return float(t_cross)
 
 def time_between_signals(
     signal_view1,
