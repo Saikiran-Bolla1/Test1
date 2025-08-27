@@ -1,3 +1,23 @@
+"""
+Robust single-timestamp detector for when a repeating signal pattern changes.
+
+You pass ONLY:
+- signal_view: object with .x (timestamps) and .y (values), or a tuple (x, y)
+
+Returns:
+- float timestamp (seconds) of the first MAJOR change, or float("nan") if none.
+
+Design goals:
+- Learn the nominal repeating pattern automatically from the first 30% (max half) of data.
+- Be tolerant to minute variations; trigger only on significant, sustained changes.
+- Combine multiple detectors:
+  1) Pattern correlation drop vs learned template (shape change)
+  2) CUSUM on mean and amplitude across windows (level/amplitude change)
+- Earliest time from the above that passes strict, sustained criteria is returned.
+
+No user-tunable parameters are exposed.
+"""
+
 from typing import Tuple
 import numpy as np
 
@@ -238,7 +258,7 @@ def _refine_time_with_period_diff(
         return t_init
 
     T = spp * dt
-    # Narrow search window near initial trigger to avoid early bias
+    # Search tightly around the initial trigger; never before learning end
     t_lo = max(learn_end_time, t_init - 0.25 * T)
     t_hi = min(tu[-1], t_init + 1.25 * T)
     m = (td >= t_lo) & (td <= t_hi)
@@ -273,11 +293,6 @@ def pattern_change_time_robust(signal_view) -> float:
     """
     Return the first timestamp (float seconds) where a MAJOR pattern change occurs.
     Minor variations are ignored by design. Returns float('nan') if none detected.
-
-    Enhancements:
-    - Finer hop (~T/12) + linear interpolation for correlation crossing.
-    - Sample-level refinement using |y[t]-y[t-T]| to localize onset.
-    - Keeps center-of-window timestamps to avoid early bias.
     """
     x, y = _as_numpy_xy(signal_view)
     if x.size < 256:
