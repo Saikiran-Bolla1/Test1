@@ -1,18 +1,19 @@
 """
-Detect the timestamp of a MAJOR disturbance in a repeating signal pattern.
+Detect the timestamp of a MAJOR disturbance in a repeating signal pattern (shape-only)
+and avoid early triggers before the actual fault time.
 
-What this version does to avoid returning NaN and mis-timing:
-- Shape-only comparisons: each window is z-normalized (offset and amplitude ignored).
-- Phase-invariant: circular correlation handles small timing jitter within a cycle.
-- Stable-template learning: uses only the most self-consistent baseline windows.
-- Pre-change stability check: requires high correlation immediately before the drop.
-- Sustained low state: requires the low-correlation state to persist (~1–2 periods).
-- Multiple fallbacks so you still get a timestamp instead of NaN when possible.
+What changed to stop early detections (e.g., 4.70 before a real 4.81):
+- Shape-only, phase-invariant correlation (offset/scale removed, circular alignment).
+- Pre-change stability gate: must see a block of high correlation immediately before fault.
+- Long persistence + confirmation: low correlation must persist and its post-mean must be low.
+- Derivative gate: require a sharp negative drop at the onset, not slow drift.
+- Offline change-point fallback on the correlation series and return the threshold crossing
+  at that change, not the first small dip.
 
 Public API
 - pattern_major_fault_time(signal_view) -> float
   signal_view: object with .x (timestamps) and .y (values), or a tuple (x, y)
-  returns: first timestamp (seconds) of a major shape change, or float("nan")
+  Returns first timestamp (seconds) of a major pattern disturbance, or float("nan").
 """
 
 from typing import Tuple, List
@@ -29,11 +30,9 @@ def _as_numpy_xy(signal_view) -> Tuple[np.ndarray, np.ndarray]:
         y = np.asarray(getattr(signal_view, "y"), dtype=float)
     if x.ndim != 1 or y.ndim != 1 or x.size != y.size:
         raise ValueError("signal_view.x and signal_view.y must be 1D arrays of the same length.")
-    # Drop NaNs, synchronized
     if np.isnan(x).any() or np.isnan(y).any():
         m = (~np.isnan(x)) & (~np.isnan(y))
         x, y = x[m], y[m]
-    # Ensure ascending time
     if x.size > 1 and not np.all(np.diff(x) >= 0):
         idx = np.argsort(x)
         x, y = x[idx], y[idx]
@@ -139,7 +138,6 @@ def _resample_unit(seg: np.ndarray, L: int) -> np.ndarray:
     return np.interp(np.linspace(0, 1, L, endpoint=False), xi, z)
 
 def _phase_invariant_corr(a: np.ndarray, b: np.ndarray) -> float:
-    # a, b already z-normalized shapes in the same length space
     na = float(np.linalg.norm(a)); nb = float(np.linalg.norm(b))
     if na == 0.0 or nb == 0.0:
         return 0.0
@@ -148,7 +146,6 @@ def _phase_invariant_corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.clip(np.max(c), -1.0, 1.0))
 
 def _template_from_learning(yu: np.ndarray, spp: int, L: int, learn_samples: int) -> np.ndarray:
-    # Build windows over the learning region and keep the most consistent ones
     hop = max(1, spp // 8)
     windows = []
     for i in range(0, learn_samples - spp, hop):
@@ -156,14 +153,11 @@ def _template_from_learning(yu: np.ndarray, spp: int, L: int, learn_samples: int
     if len(windows) < 6:
         return np.array([], dtype=float)
     W = np.stack(windows, axis=0)
-    # Initial template = mean
     tpl = np.mean(W, axis=0)
     n = float(np.linalg.norm(tpl))
     if n > 0:
         tpl = tpl / n
-    # Score windows by correlation to initial template
     scores = np.array([_phase_invariant_corr(w, tpl) for w in W], dtype=float)
-    # Keep top K consistent windows
     order = np.argsort(-scores)
     K = min(16, max(8, len(order)//2))
     top = W[order[:K]]
@@ -173,12 +167,11 @@ def _template_from_learning(yu: np.ndarray, spp: int, L: int, learn_samples: int
         tpl = tpl / n
     return tpl
 
-# ------------------------------- Detection ---------------------------------- #
+# ------------------------------ Correlation TS ------------------------------ #
 
 def _correlation_series(tu: np.ndarray, yu: np.ndarray, spp: int, L: int, template: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
-    hop = max(1, spp // 8)  # ~8 hops per period
-    times = []
-    corr = []
+    hop = max(1, spp // 8)  # ~8 hops/period
+    times, corr = [], []
     N = yu.size
     for i in range(0, N - spp, hop):
         seg = yu[i:i+spp]
@@ -188,142 +181,107 @@ def _correlation_series(tu: np.ndarray, yu: np.ndarray, spp: int, L: int, templa
         corr.append(c)
     return np.asarray(times, dtype=float), np.asarray(corr, dtype=float), hop
 
-def _interpolated_first_drop_strict(times: np.ndarray, corrs: np.ndarray, learn_end_time: float, mc: float, sc: float, spp: int, hop: int) -> float:
-    # Threshold: big drop and also low absolute correlation
-    thr = min(mc - 5.0 * sc, 0.40)
-    # Persistence: ~1.5 periods below threshold (helps avoid early detections)
-    hold_after = max(4, int(round(1.5 * spp / hop)))
-    # Pre-stability: ~0.75 periods of high correlation before the change
-    pre_ok_windows = max(3, int(round(0.75 * spp / hop)))
-    pre_thr = max(0.72, mc - 1.0 * sc)
+# ------------------------- Change-point fallback ---------------------------- #
+
+def _argmax_change_point(series: np.ndarray, start_idx: int, min_left: int, min_right: int) -> int:
+    """
+    Offline single change-point by maximizing within-segment SSE reduction.
+    Returns index j (split between j and j+1). -1 if not found.
+    """
+    n = series.size
+    if n < start_idx + min_left + min_right + 2:
+        return -1
+    x = series
+    c1 = np.cumsum(x)
+    c2 = np.cumsum(x*x)
+    best_j, best_gain = -1, 0.0
+    for j in range(start_idx + min_left, n - min_right - 1):
+        n1 = j + 1
+        n2 = n - n1
+        s1 = c1[j] - (c1[start_idx-1] if start_idx > 0 else 0.0)
+        s2 = (c1[-1] - c1[j])
+        ss1 = c2[j] - (c2[start_idx-1] if start_idx > 0 else 0.0)
+        ss2 = c2[-1] - c2[j]
+        n1_eff = n1 - start_idx
+        n2_eff = n2
+        if n1_eff <= 0 or n2_eff <= 0:
+            continue
+        m1 = s1 / n1_eff
+        m2 = s2 / n2_eff
+        sse1 = ss1 - n1_eff * m1 * m1
+        sse2 = ss2 - n2_eff * m2 * m2
+        total_sse = sse1 + sse2
+        # Baseline SSE (no split) over [start_idx, n-1]
+        s_all = c1[-1] - (c1[start_idx-1] if start_idx > 0 else 0.0)
+        ss_all = c2[-1] - (c2[start_idx-1] if start_idx > 0 else 0.0)
+        n_all = n - start_idx
+        m_all = s_all / n_all
+        sse_all = ss_all - n_all * m_all * m_all
+        gain = sse_all - total_sse
+        if gain > best_gain:
+            best_gain, best_j = gain, j
+    return best_j
+
+# --------------------- Strict first-drop with confirmation ------------------ #
+
+def _first_confirmed_drop_time(times: np.ndarray,
+                               corr_s: np.ndarray,
+                               learn_end_time: float,
+                               mc: float, sc: float,
+                               spp: int, hop: int) -> float:
+    low_thr = min(mc - 5.0 * sc, 0.40)
+    pre_high_thr = max(0.78, mc - 0.8 * sc)
+    hold_low = max(4, int(round(1.2 * spp / hop)))        # ~1.2 periods low
+    confirm_win = max(4, int(round(0.8 * spp / hop)))     # confirm next ~0.8 period stays low
+    pre_need = max(3, int(round(0.8 * spp / hop)))        # need ~0.8 period high before
 
     j0 = int(np.searchsorted(times, learn_end_time, side="right"))
-    below = corrs < thr
-
-    # Scan for a run of low correlation preceded by high/stable correlation
-    run = 0
-    for j in range(j0, len(times)):
-        if below[j]:
-            run += 1
-        else:
-            run = 0
-        if run >= hold_after:
-            s = j - run + 1  # start index of low-corr run
-            # Check pre-stability just before s
-            p0 = max(0, s - pre_ok_windows)
-            if p0 < s and np.all(corrs[p0:s] > pre_thr):
-                # Interpolate first threshold crossing between last high and first low
-                k = s - 1
-                while k >= j0 and below[k]:
-                    k -= 1
-                if k < j0:
-                    return float(times[s])
-                y0, y1 = float(corrs[k]), float(corrs[k+1])
-                t0, t1 = float(times[k]), float(times[k+1])
-                if y1 == y0 or t1 == t0:
-                    return float(times[s])
-                alpha = (thr - y0) / (y1 - y0)
-                alpha = float(np.clip(alpha, 0.0, 1.0))
-                return float(t0 + alpha * (t1 - t0))
-    return float("nan")
-
-# ---------------------------- Windowed fallback (no T) ---------------------- #
-
-def _window_shape_change_time(tu: np.ndarray, yu: np.ndarray, learn_end_time: float) -> float:
-    """
-    Fallback: detect shape change without relying on an accurate period.
-    Returns earliest time where correlation to a baseline window-template drops and stays low.
-    """
-    N = tu.size
-    if N < 128:
+    if j0 >= times.size:
         return float("nan")
 
-    # Window ~ 5% of record (clipped), hop quarter window
-    W = int(np.clip(N // 20, 64, N // 6))
-    hop = max(1, W // 4)
-    L = 128  # template length
+    # Derivative gate (use robust baseline of diffs)
+    diffs = np.diff(corr_s[:max(j0, 3)]) if j0 > 3 else np.array([0.0])
+    _, sd_diff = _robust_mean_std(diffs)
+    drop_deriv_thr = max(3.0 * sd_diff, 0.06)
 
-    # Build baseline windows (<= learn_end_time)
-    windows = []
-    win_times = []
-    for i in range(0, N - W, hop):
-        seg = yu[i:i+W]
-        z = _resample_unit(seg, L)
-        windows.append(z)
-        win_times.append(tu[i + W // 2])
-    windows = np.asarray(windows, dtype=float)
-    win_times = np.asarray(win_times, dtype=float)
-    if windows.shape[0] < 8:
-        return float("nan")
-
-    base_mask = win_times <= learn_end_time
-    if not np.any(base_mask):
-        return float("nan")
-    Zb = windows[base_mask]
-    tpl = np.mean(Zb, axis=0)
-    n = float(np.linalg.norm(tpl))
-    if n > 0:
-        tpl = tpl / n
-    else:
-        return float("nan")
-
-    # Score all windows
-    corr = np.array([_phase_invariant_corr(w, tpl) for w in windows], dtype=float)
-    times = win_times.copy()
-
-    # Smooth lightly
-    corr_s = _median_filter(corr, k=5)
-
-    # Baseline stats
-    mc, sc = _robust_mean_std(corr_s[base_mask])
-    if not np.isfinite(mc) or not np.isfinite(sc):
-        return float("nan")
-    thr = min(mc - 4.0 * sc, 0.50)
-
-    # Sustained drop ~30% of window
-    hold_windows = max(2, int(round(0.30 * (W / hop))))
-    j0 = int(np.searchsorted(times, learn_end_time, side="right"))
-
-    # Pre-stability: require several windows just before drop to be high
-    pre_ok = max(3, int(round(0.50 * (W / hop))))
-    pre_thr = max(0.70, mc - 1.0 * sc)
-
-    below = corr_s < thr
+    below = corr_s < low_thr
     run = 0
     for j in range(j0, times.size):
         if below[j]:
             run += 1
         else:
             run = 0
-        if run >= hold_windows:
-            s = j - run + 1
-            p0 = max(0, s - pre_ok)
-            if p0 < s and np.all(corr_s[p0:s] > pre_thr):
-                # interpolate crossing between last high and first low
-                k = s - 1
-                while k >= j0 and below[k]:
-                    k -= 1
-                if k < j0:
-                    return float(times[s])
+        if run >= hold_low:
+            s = j - run + 1  # start of low run
+            # Pre-high gate
+            p0 = max(j0, s - pre_need)
+            if not (p0 < s and np.all(corr_s[p0:s] > pre_high_thr)):
+                continue
+            # Deriv gate at onset (use last high -> first low step)
+            k = s - 1
+            while k >= j0 and below[k]:
+                k -= 1
+            if k < j0:
+                k = s
+            if k > 0:
+                step = corr_s[k+1] - corr_s[k]
+                if step > -drop_deriv_thr:
+                    continue
+
+            # Confirmation: the next block should stay low on average
+            tail = corr_s[s: s + confirm_win]
+            if tail.size == 0 or float(np.mean(tail)) > (low_thr - 0.03):
+                continue
+
+            # Interpolate crossing between last high and first low
+            if k >= j0 and k + 1 < times.size:
                 y0, y1 = float(corr_s[k]), float(corr_s[k+1])
                 t0, t1 = float(times[k]), float(times[k+1])
-                if y1 == y0 or t1 == t0:
-                    return float(times[s])
-                alpha = (thr - y0) / (y1 - y0)
-                alpha = float(np.clip(alpha, 0.0, 1.0))
-                return float(t0 + alpha * (t1 - t0))
-
-    # Last resort: biggest post-baseline negative jump that stays low afterwards
-    post_mask = np.arange(times.size) >= j0
-    if np.any(post_mask):
-        diffs = np.diff(corr_s[post_mask])
-        if diffs.size > 0:
-            jm = int(np.argmin(diffs))  # largest drop
-            idx = j0 + jm + 1
-            tail_low = np.mean(corr_s[idx: idx + max(3, hold_windows)]) < (mc - 2.5 * sc)
-            if tail_low:
-                return float(times[idx])
-
+                if t1 != t0 and y1 != y0:
+                    alpha = (low_thr - y0) / (y1 - y0)
+                    alpha = float(np.clip(alpha, 0.0, 1.0))
+                    return float(t0 + alpha * (t1 - t0))
+            return float(times[s])
     return float("nan")
 
 # --------------------------------- Main ------------------------------------- #
@@ -333,42 +291,88 @@ def pattern_major_fault_time(signal_view) -> float:
     if x.size < 128:
         return float("nan")
 
-    # 1) Uniform resample
     tu, yu, dt = _uniform_resample(x, y)
     if not np.isfinite(dt) or tu.size < 128:
         return float("nan")
 
-    # 2) Learn window (~30% but max half)
+    # Learn window (~30% capped at half)
     N = tu.size
     N_learn = min(max(128, int(0.30 * N)), max(128, N // 2))
     learn_end_time = float(tu[min(N_learn - 1, N - 1)])
     yL = yu[:N_learn]
 
-    # 3) Period estimate on learn window
+    # Estimate period and samples per period
     T = _best_period(yL, dt)
-    if np.isfinite(T):
-        spp = int(round(T / dt))
-        if 12 <= spp <= max(16, N_learn // 2):
-            # Template from baseline region
-            L = 128
-            template = _template_from_learning(yu, spp, L, learn_samples=N_learn)
-            if template.size > 0:
-                times, corr, hop = _correlation_series(tu, yu, spp, L, template)
-                if times.size > 0:
-                    corr_s = _median_filter(corr, k=5)
-                    learn_mask = times <= learn_end_time
-                    if np.any(learn_mask):
-                        mc, sc = _robust_mean_std(corr_s[learn_mask])
-                        if np.isfinite(mc) and np.isfinite(sc):
-                            t = _interpolated_first_drop_strict(times, corr_s, learn_end_time, mc, sc, spp, hop)
-                            if np.isfinite(t):
-                                return float(t)
+    if not np.isfinite(T):
+        return float("nan")
+    spp = int(round(T / dt))
+    if spp < 12 or spp > N_learn // 2:
+        return float("nan")
 
-    # 4) Fallback: windowed detection without accurate period
-    t_fb = _window_shape_change_time(tu, yu, learn_end_time)
-    if np.isfinite(t_fb):
-        return float(t_fb)
+    # Template from learning region
+    L = 128
+    template = _template_from_learning(yu, spp, L, learn_samples=N_learn)
+    if template.size == 0:
+        return float("nan")
 
-    return float("nan")
+    # Correlation time series across full record
+    times, corr, hop = _correlation_series(tu, yu, spp, L, template)
+    if times.size == 0:
+        return float("nan")
+
+    # Smooth slightly to suppress minute blips
+    corr_s = _median_filter(corr, k=5)
+
+    # Baseline stats inside learn region
+    learn_mask = times <= learn_end_time
+    if not np.any(learn_mask):
+        return float("nan")
+    mc, sc = _robust_mean_std(corr_s[learn_mask])
+    if not np.isfinite(mc) or not np.isfinite(sc):
+        return float("nan")
+
+    # Primary: strict first-drop with stability + confirmation + derivative gate
+    t_primary = _first_confirmed_drop_time(times, corr_s, learn_end_time, mc, sc, spp, hop)
+
+    # Fallback: offline change-point on correlation and take threshold-crossing near CP
+    t_cp = float("nan")
+    j0 = int(np.searchsorted(times, learn_end_time, side="right"))
+    min_left = max(4, int(round(0.8 * spp / hop)))
+    min_right = max(4, int(round(0.8 * spp / hop)))
+    jcp = _argmax_change_point(corr_s, j0, min_left, min_right)
+    if jcp != -1:
+        # Validate CP: post mean significantly lower than pre mean
+        pre = corr_s[max(j0, jcp - min_left): jcp + 1]
+        post = corr_s[jcp + 1: min(times.size, jcp + 1 + min_right)]
+        if pre.size > 0 and post.size > 0:
+            pre_m = float(np.mean(pre))
+            post_m = float(np.mean(post))
+            drop = pre_m - post_m
+            if drop >= max(0.20, 3.0 * sc):
+                low_thr = min(mc - 5.0 * sc, 0.40)
+                # Walk backward from CP to find first crossing of low_thr
+                k = jcp
+                while k > j0 and corr_s[k-1] >= low_thr:
+                    k -= 1
+                # Interpolate between k-1 and k
+                if k > j0:
+                    y0, y1 = float(corr_s[k-1]), float(corr_s[k])
+                    t0, t1 = float(times[k-1]), float(times[k])
+                    if t1 != t0 and y1 != y0:
+                        alpha = (low_thr - y0) / (y1 - y0)
+                        alpha = float(np.clip(alpha, 0.0, 1.0))
+                        t_cp = float(t0 + alpha * (t1 - t0))
+                    else:
+                        t_cp = float(times[k])
+                else:
+                    t_cp = float(times[max(j0, k)])
+
+    # Choose the later of the two (to avoid early false starts), but if only one exists use it
+    candidates = [t for t in (t_primary, t_cp) if np.isfinite(t)]
+    if not candidates:
+        return float("nan")
+    if len(candidates) == 2:
+        return float(max(candidates))
+    return float(candidates[0])
 
 __all__ = ["pattern_major_fault_time"]
