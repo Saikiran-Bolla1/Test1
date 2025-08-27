@@ -627,21 +627,23 @@ __all__ = [
 
 
 """
-Robustly detect when a repeating signal pattern becomes disturbed (fault start).
+Robust single-timestamp detector for when a repeating signal pattern changes.
 
 You pass ONLY:
 - signal_view: object with .x (timestamps) and .y (values), or a tuple (x, y)
 
 Returns:
-- float timestamp (seconds) of the first disturbance, or float("nan") if not detected.
+- float timestamp (seconds) of the first MAJOR change, or float("nan") if none.
 
-Key points
-- No pattern is provided by the user: the function auto-learns it from the first 30% of data.
-- Tolerant to small variations: uses robust statistics (median/MAD) to set adaptive thresholds.
-- Multiple fallbacks: FFT and autocorrelation for period; correlation-based detection and a
-  mean-level fallback to catch large DC/shape changes that still correlate moderately.
+Design goals:
+- Learn the nominal repeating pattern automatically from the first 30% (max half) of data.
+- Be tolerant to minute variations; trigger only on significant, sustained changes.
+- Combine multiple detectors:
+  1) Pattern correlation drop vs learned template (shape change)
+  2) CUSUM on mean and amplitude across windows (level/amplitude change)
+- Earliest time from the above that passes strict, sustained criteria is returned.
 
-This is a drop-in replacement for earlier pattern_fault_time implementations that were too strict.
+No user-tunable parameters are exposed.
 """
 
 from typing import Tuple
@@ -675,25 +677,28 @@ def _as_numpy_xy(signal_view) -> Tuple[np.ndarray, np.ndarray]:
 
 def _uniform_resample(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
     """Resample to a uniform grid using linear interpolation. Returns (tu, yu, dt)."""
-    if x.size < 4:
+    if x.size < 8:
         return x, y, np.inf
     dt = float(np.median(np.diff(x)))
     if not np.isfinite(dt) or dt <= 0:
         return x, y, np.inf
     tu = np.arange(x[0], x[-1] + 0.5 * dt, dt)
-    if tu.size < 4:
+    if tu.size < 8:
         return x, y, np.inf
     yu = np.interp(tu, x, y)
     return tu, yu, dt
 
 def _robust_mean_std(a: np.ndarray) -> Tuple[float, float]:
-    """Median and robust sigma estimate via MAD (scaled)."""
+    """Median and robust sigma via MAD (scaled). Falls back to std if needed."""
     a = a[np.isfinite(a)]
     if a.size == 0:
         return float("nan"), float("nan")
     med = float(np.median(a))
     mad = float(np.median(np.abs(a - med)))
-    sigma = 1.4826 * mad  # Gaussian consistent
+    sigma = 1.4826 * mad
+    if not np.isfinite(sigma) or sigma == 0:
+        s = float(np.std(a))
+        sigma = s if s > 0 else 1e-12
     return med, sigma
 
 # ---------------------------- Period estimation ----------------------------- #
@@ -701,7 +706,7 @@ def _robust_mean_std(a: np.ndarray) -> Tuple[float, float]:
 def _estimate_period_fft(y: np.ndarray, dt: float) -> float:
     """Estimate dominant period via FFT of zero-mean data; NaN if not reliable."""
     N = y.size
-    if N < 32 or not np.isfinite(dt) or dt <= 0:
+    if N < 64 or not np.isfinite(dt) or dt <= 0:
         return np.nan
     z = y - np.mean(y)
     if np.allclose(z, 0.0):
@@ -712,7 +717,7 @@ def _estimate_period_fft(y: np.ndarray, dt: float) -> float:
         return np.nan
     mag = np.abs(Z)
     mag[0] = 0.0  # ignore DC
-    # band: at least ~3 cycles in window and <= 90% Nyquist
+    # at least ~3 cycles in window and <= 90% Nyquist
     fmin = 3.0 / (N * dt)
     fmax = 0.45 / dt
     band = (f >= fmin) & (f <= fmax)
@@ -726,17 +731,15 @@ def _estimate_period_fft(y: np.ndarray, dt: float) -> float:
 def _estimate_period_acf(y: np.ndarray, dt: float) -> float:
     """Estimate dominant period via autocorrelation peak; NaN if not reliable."""
     N = y.size
-    if N < 64 or not np.isfinite(dt) or dt <= 0:
+    if N < 128 or not np.isfinite(dt) or dt <= 0:
         return np.nan
     z = y - np.mean(y)
     if np.allclose(z, 0.0):
         return np.nan
-    # FFT-based autocorrelation
-    L = int(1 << (N - 1).bit_length())  # next pow2 for speed
+    L = int(1 << (N - 1).bit_length())
     Z = np.fft.rfft(z, n=2 * L)
     ac = np.fft.irfft(np.abs(Z) ** 2)[:N]
     ac = ac / max(ac[0], 1e-12)
-    # search lag range: 3 cycles min within window -> lag <= N/3
     min_lag = 3
     max_lag = N // 3
     if max_lag <= min_lag:
@@ -802,45 +805,72 @@ def _align_and_average(y: np.ndarray, spp: int, max_periods: int = 12, template_
         tpl = tpl / norm
     return tpl
 
-def _window_correlation(y: np.ndarray, i: int, spp: int, template: np.ndarray) -> float:
-    """Normalized correlation of one window (length spp) to template (phase grid)."""
+def _window_features(y: np.ndarray, i: int, spp: int, template: np.ndarray) -> Tuple[float, float, float, float]:
+    """
+    Features for window y[i:i+spp]:
+    - correlation to template (normalized)
+    - mean
+    - std
+    - peak-to-peak amplitude
+    """
     seg = y[i:i + spp]
     if seg.size != spp:
-        return np.nan
-    seg = seg - np.mean(seg)
-    std = float(np.std(seg))
-    if std == 0:
-        return 0.0
-    seg = seg / std
-    # resample to template length
+        return np.nan, np.nan, np.nan, np.nan
+    m = float(np.mean(seg))
+    s = float(np.std(seg))
+    a = float(np.max(seg) - np.min(seg))
+    # normalized correlation
+    z = seg - m
+    if s > 0:
+        z = z / s
     xi = np.linspace(0, 1, seg.size, endpoint=False)
-    seg_t = np.interp(np.linspace(0, 1, template.size, endpoint=False), xi, seg)
+    seg_t = np.interp(np.linspace(0, 1, template.size, endpoint=False), xi, z)
     denom = float(np.linalg.norm(seg_t))
-    if denom == 0:
-        return 0.0
-    return float(np.dot(seg_t, template) / denom)
+    c = float(np.dot(seg_t, template) / denom) if denom > 0 else 0.0
+    return c, m, s, a
+
+# ------------------------------- CUSUM -------------------------------------- #
+
+def _cusum_first_time(series: np.ndarray, times: np.ndarray, baseline: float, sigma: float, k_sigma: float, h_sigma: float, start_idx: int) -> float:
+    """
+    One-sided two-direction CUSUM on a windowed feature series.
+    Returns first time where either pos or neg CUSUM crosses h_sigma*sigma, else NaN.
+    """
+    if not np.isfinite(sigma) or sigma == 0:
+        return float("nan")
+    k = k_sigma * sigma
+    h = h_sigma * sigma
+
+    s_pos = 0.0
+    s_neg = 0.0
+    for j in range(start_idx, series.size):
+        x = float(series[j]) - baseline
+        s_pos = max(0.0, s_pos + (x - k))
+        s_neg = min(0.0, s_neg + (x + k))
+        if s_pos > h or abs(s_neg) > h:
+            return float(times[j])
+    return float("nan")
 
 # ------------------------------ Main detector ------------------------------- #
 
-def pattern_fault_time(signal_view) -> float:
+def pattern_change_time_robust(signal_view) -> float:
     """
-    Return the first timestamp (float seconds) where the auto-learned repeating pattern
-    is disturbed and stays disturbed briefly. Returns float('nan') if not detected.
+    Return the first timestamp (float seconds) where a MAJOR pattern change occurs.
+    Minor variations are ignored by design. Returns float('nan') if none detected.
     """
     x, y = _as_numpy_xy(signal_view)
-    if x.size < 128:
+    if x.size < 256:
         return float("nan")
 
     # Uniform resample
     tu, yu, dt = _uniform_resample(x, y)
-    if not np.isfinite(dt) or tu.size < 128:
+    if not np.isfinite(dt) or tu.size < 256:
         return float("nan")
 
-    # Learn window
+    # Learn baseline window
     learn_fraction = 0.30
     N = tu.size
-    N_learn = max(128, int(N * learn_fraction))
-    N_learn = min(N_learn, max(128, N // 2))
+    N_learn = min(max(256, int(N * learn_fraction)), max(256, N // 2))
     yL = yu[:N_learn]
 
     # Period estimate
@@ -848,64 +878,77 @@ def pattern_fault_time(signal_view) -> float:
     if not np.isfinite(T):
         return float("nan")
     spp = int(round(T / dt))
-    if spp < 8:
-        return float("nan")
-    if spp > N_learn // 2:
-        # Estimated period too long for reliable learning
+    if spp < 12 or spp > N_learn // 2:
         return float("nan")
 
-    # Template
+    # Template from learning region
     template = _align_and_average(yL, spp, max_periods=12, template_points=128)
     if template.size == 0:
         return float("nan")
 
-    # Sliding correlation (tolerant)
-    hop = max(1, int(round(spp / 8)))               # ~8 hops per period
-    hold_windows = max(1, int(round(0.1 * spp / hop)))  # ~10% of a period
-    corrs, times, means = [], [], []
+    # Sliding features across full record
+    hop = max(1, int(round(spp / 8)))  # ~8 hops per period
+    times = []
+    corr = []
+    meanv = []
+    stdv = []
+    ampv = []
     for i in range(0, N - spp, hop):
-        c = _window_correlation(yu, i, spp, template)
-        corrs.append(c)
-        means.append(float(np.mean(yu[i:i + spp])))
+        c, m, s, a = _window_features(yu, i, spp, template)
         times.append(tu[i + spp // 2])
-    corrs = np.asarray(corrs, dtype=float)
-    means = np.asarray(means, dtype=float)
+        corr.append(c)
+        meanv.append(m)
+        stdv.append(s)
+        ampv.append(a)
     times = np.asarray(times, dtype=float)
+    corr = np.asarray(corr, dtype=float)
+    meanv = np.asarray(meanv, dtype=float)
+    stdv = np.asarray(stdv, dtype=float)
+    ampv = np.asarray(ampv, dtype=float)
     if times.size == 0:
         return float("nan")
 
-    # Baseline stats from learn region
-    learn_mask = times <= tu[min(N_learn - 1, N - 1)]
+    # Baseline stats (learn region)
+    learn_end_time = tu[min(N_learn - 1, N - 1)]
+    learn_mask = times <= learn_end_time
     if not np.any(learn_mask):
         return float("nan")
-    base_corr = corrs[learn_mask]
-    base_mean = means[learn_mask]
 
-    mc, sc = _robust_mean_std(base_corr)
-    mm, sm = _robust_mean_std(base_mean)
-    if not np.isfinite(mc) or not np.isfinite(sc) or not np.isfinite(mm) or not np.isfinite(sm):
+    mc, sc = _robust_mean_std(corr[learn_mask])
+    mm, sm = _robust_mean_std(meanv[learn_mask])
+    ms, ss = _robust_mean_std(stdv[learn_mask])
+    ma, sa = _robust_mean_std(ampv[learn_mask])
+    if not all(np.isfinite(v) for v in (mc, sc, mm, sm, ms, ss, ma, sa)):
         return float("nan")
 
-    # Adaptive thresholds
-    corr_floor = max(0.3, mc - 2.5 * sc, 0.85 * mc)      # relative drop
-    mean_dev_thr = max(3.0 * sm, 0.01 * max(1.0, abs(mm)))  # scale-aware
+    # Detector A: correlation drop (shape change), sustained
+    # Strict threshold to ignore minute changes
+    corr_thr = min(mc - 4.5 * sc, 0.45)
+    hold_windows = max(3, int(round(0.4 * spp / hop)))  # ~40% of a period sustained
+    j0 = int(np.searchsorted(times, learn_end_time, side="right"))
+    bad_corr = corr < corr_thr
 
-    # Start scanning after learning window
-    j0 = int(np.searchsorted(times, tu[min(N_learn - 1, N - 1)], side="right"))
-    bad_corr = corrs < corr_floor
-    bad_mean = np.abs(means - mm) > mean_dev_thr
-
-    # Require sustained violation by either criterion
+    tA = float("nan")
     run = 0
     for j in range(j0, times.size):
-        if bad_corr[j] or bad_mean[j]:
+        if bad_corr[j]:
             run += 1
             if run >= hold_windows:
-                # return time of first disturbed window, not delayed
-                return float(times[j - run + 1])
+                tA = float(times[j - hold_windows + 1])
+                break
         else:
             run = 0
 
-    return float("nan")
+    # Detector B: CUSUM on window mean (level shift)
+    tB = _cusum_first_time(meanv, times, mm, sm, k_sigma=0.5, h_sigma=8.0, start_idx=j0)
 
-__all__ = ["pattern_fault_time"]
+    # Detector C: CUSUM on window amplitude (pulse height/width changes)
+    tC = _cusum_first_time(ampv, times, ma, sa, k_sigma=0.5, h_sigma=8.0, start_idx=j0)
+
+    # Choose earliest valid time
+    candidates = [t for t in (tA, tB, tC) if np.isfinite(t)]
+    if not candidates:
+        return float("nan")
+    return float(min(candidates))
+
+__all__ = ["pattern_change_time_robust"]
