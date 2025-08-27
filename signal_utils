@@ -110,23 +110,28 @@ def getvaluebytimestamp(signal_view, timestamp: float) -> Optional[float]:
 
 # ------------------------------- Edge finding ------------------------------- #
 
-def _find_all_edge_times(
-    signal_view,
-    threshold: float,
-    edge: Edge = "rising",
-    atol: float = 1e-8
-) -> np.ndarray:
+def _interp_cross_time(x0: float, x1: float, y0: float, y1: float, thr: float) -> float:
+    # Linear interpolation for the crossing at threshold thr
+    if y1 == y0:
+        return float(x0)
+    return float(x0 + (x1 - x0) * (thr - y0) / (y1 - y0))
+
+def find_edge_time(signal_view, value: float, atol: float, edge: Edge) -> float:
     """
-    INTERNAL: Returns all timestamps where the signal crosses 'threshold' using a small hysteresis band.
-    Not exported to keep the public API focused on single-timestamp outputs.
+    First edge crossing time at 'value' with direction 'edge'.
+    Returns float('nan') if not found.
     """
     x, y = _as_numpy_xy(signal_view)
-    if x.size < 2:
-        return np.array([], dtype=float)
+    n = y.size
+    if n < 2:
+        return float("nan")
 
-    thr_up = threshold + float(atol)
-    thr_dn = threshold - float(atol)
+    thr = float(value)
+    tol = float(atol)
+    thr_up = thr + tol
+    thr_dn = thr - tol
 
+    # A) Hysteresis crossing
     if edge == "rising":
         mask = (y[:-1] <= thr_dn) & (y[1:] >= thr_up)
     elif edge == "falling":
@@ -135,39 +140,27 @@ def _find_all_edge_times(
         raise ValueError("edge must be 'rising' or 'falling'")
 
     idxs = np.flatnonzero(mask)
-    if idxs.size == 0:
-        return np.array([], dtype=float)
+    if idxs.size > 0:
+        i = int(idxs[0])
+        return _interp_cross_time(x[i], x[i + 1], y[i], y[i + 1], thr)
 
-    times = np.empty(idxs.size, dtype=float)
-    for k, i in enumerate(idxs):
-        times[k] = _interp_cross_time(x[i], x[i + 1], y[i], y[i + 1], threshold)
-    return times
+    # B) Exact-sample match within tolerance
+    exact = np.flatnonzero(np.abs(y - thr) <= tol)
+    if exact.size > 0:
+        return float(x[int(exact[0])])
 
-def find_first_edge_time(
-    signal_view,
-    threshold: float,
-    edge: Edge = "rising",
-    atol: float = 1e-8
-) -> float:
-    """
-    Returns the first timestamp where the signal crosses 'threshold' using hysteresis as a float.
-    Returns NaN if no crossing is found.
-    """
-    times = _find_all_edge_times(signal_view, threshold, edge=edge, atol=atol)
-    return float(times[0]) if times.size > 0 else float("nan")
+    # C) Non-hysteresis crossing (touching counts)
+    if edge == "rising":
+        mask2 = (y[:-1] <= thr) & (y[1:] >= thr)
+    else:  # falling
+        mask2 = (y[:-1] >= thr) & (y[1:] <= thr)
 
-def find_edge_times(
-    signal_view,
-    value: float,
-    edge: Edge = "rising",
-    atol: float = 1e-8
-) -> float:
-    """
-    Backwards-compatible helper that matches the original function's behavior:
-    - Returns only the FIRST crossing time as a Python float (NaN if none).
-    For all crossings, use internal _find_all_edge_times (not exported).
-    """
-    return find_first_edge_time(signal_view, value, edge=edge, atol=atol)
+    idxs2 = np.flatnonzero(mask2)
+    if idxs2.size > 0:
+        i = int(idxs2[0])
+        return _interp_cross_time(x[i], x[i + 1], y[i], y[i + 1], thr)
+
+    return float("nan")
 
 def time_between_signals(
     signal_view1,
