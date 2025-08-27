@@ -1,22 +1,26 @@
 """
-Signal analysis helpers for detecting edges, steps, bursts, and general value/time interpolation.
+Signal analysis helpers updated to return a single float timestamp for any API that outputs a time.
 
-This module provides:
-- Robust edge detection with hysteresis (first or all edges).
+Conventions for time-returning functions:
+- Always return a Python float (seconds).
+- If an event is not found, return float("nan") instead of None or arrays.
+
+Provided features:
+- Robust edge detection (first edge only as public API).
 - Step start detection (stable low -> crossing -> stable high).
 - Burst start detection (first edge after a quiet gap with optional confirmation).
-- Interpolation helpers: get value at timestamp and timestamp at value.
-- Misc utilities (persistent value, pattern match, trends, stuck/updating check).
+- Interpolation helpers (value at time, time at value).
+- Misc utilities (persistent value time, pattern match time, trends, stuck start time).
 - In-place scaling helper for recorder results (_SignalView-like objects).
 
 Expected 'signal_view' interface:
 - signal_view.x: 1D array-like of timestamps (preferably increasing).
 - signal_view.y: 1D array-like of values (same length as x).
 
-Author: GitHub Copilot
+Author: GitHub Copilot (updated per "single float timestamp" requirement)
 """
 
-from typing import Optional, List, Literal, Tuple, Union
+from typing import List, Literal, Tuple, Union, Optional
 import numpy as np
 
 Edge = Literal["rising", "falling"]
@@ -25,13 +29,19 @@ Edge = Literal["rising", "falling"]
 
 def _as_numpy_xy(signal_view) -> Tuple[np.ndarray, np.ndarray]:
     """Return x, y as numpy arrays and ensure they are sorted by time ascending."""
-    x = np.asarray(signal_view.x, dtype=float)
-    y = np.asarray(signal_view.y, dtype=float)
+    # Accept either a (x, y) tuple or an object with .x and .y
+    if isinstance(signal_view, tuple) and len(signal_view) == 2:
+        x = np.asarray(signal_view[0], dtype=float)
+        y = np.asarray(signal_view[1], dtype=float)
+    else:
+        x = np.asarray(signal_view.x, dtype=float)
+        y = np.asarray(signal_view.y, dtype=float)
+
     if x.ndim != 1 or y.ndim != 1 or x.size != y.size:
         raise ValueError("signal_view.x and signal_view.y must be 1D arrays of the same length.")
 
     # Ensure increasing order in time
-    if not np.all(np.diff(x) >= 0):
+    if x.size > 1 and not np.all(np.diff(x) >= 0):
         idx = np.argsort(x)
         x = x[idx]
         y = y[idx]
@@ -45,16 +55,16 @@ def _interp_cross_time(x0: float, x1: float, y0: float, y1: float, thr: float) -
 
 # ------------------------- Interpolation convenience ------------------------ #
 
-def gettimestampbyvalue(signal_view, value: float) -> Optional[float]:
+def gettimestampbyvalue(signal_view, value: float) -> float:
     """
-    Returns the first timestamp where the signal crosses a given 'value'.
+    Returns the first timestamp where the signal crosses a given 'value' as a float.
     - If the value is exactly present, returns its first occurrence.
     - Otherwise, uses linear interpolation between the two points around the crossing.
-    - Returns None if no crossing found or value is outside the signal's range.
+    - Returns NaN if no crossing found or value is outside the signal's range.
     """
     x, y = _as_numpy_xy(signal_view)
     if y.size < 2 or value < np.min(y) or value > np.max(y):
-        return None
+        return float("nan")
 
     # exact match first
     exact = np.flatnonzero(y == value)
@@ -64,7 +74,7 @@ def gettimestampbyvalue(signal_view, value: float) -> Optional[float]:
     # sign change around value
     indices = np.flatnonzero(np.diff(np.sign(y - value)) != 0)
     if indices.size == 0:
-        return None
+        return float("nan")
 
     i = int(indices[0])
     return _interp_cross_time(x[i], x[i + 1], y[i], y[i + 1], value)
@@ -75,6 +85,7 @@ def getvaluebytimestamp(signal_view, timestamp: float) -> Optional[float]:
     - If the timestamp is exactly present, returns the exact sample value.
     - Otherwise, linearly interpolates using the two neighboring timestamps.
     - Returns None if timestamp is outside [min(x), max(x)] or x has fewer than 2 samples.
+    Note: This function returns a value (not a time), so it keeps Optional[float].
     """
     x, y = _as_numpy_xy(signal_view)
     if x.size < 2 or timestamp < x[0] or timestamp > x[-1]:
@@ -99,18 +110,15 @@ def getvaluebytimestamp(signal_view, timestamp: float) -> Optional[float]:
 
 # ------------------------------- Edge finding ------------------------------- #
 
-def find_all_edge_times(
+def _find_all_edge_times(
     signal_view,
     threshold: float,
     edge: Edge = "rising",
     atol: float = 1e-8
 ) -> np.ndarray:
     """
-    Returns all timestamps where the signal crosses 'threshold' using a small hysteresis band.
-    Hysteresis:
-      - rising: y[:-1] <= thr-atol and y[1:] >= thr+atol
-      - falling: y[:-1] >= thr+atol and y[1:] <= thr-atol
-    Returns an array (possibly empty) of crossing times (float).
+    INTERNAL: Returns all timestamps where the signal crosses 'threshold' using a small hysteresis band.
+    Not exported to keep the public API focused on single-timestamp outputs.
     """
     x, y = _as_numpy_xy(signal_view)
     if x.size < 2:
@@ -142,10 +150,10 @@ def find_first_edge_time(
     atol: float = 1e-8
 ) -> float:
     """
-    Returns the first timestamp where the signal crosses 'threshold' using hysteresis.
+    Returns the first timestamp where the signal crosses 'threshold' using hysteresis as a float.
     Returns NaN if no crossing is found.
     """
-    times = find_all_edge_times(signal_view, threshold, edge=edge, atol=atol)
+    times = _find_all_edge_times(signal_view, threshold, edge=edge, atol=atol)
     return float(times[0]) if times.size > 0 else float("nan")
 
 def find_edge_times(
@@ -157,7 +165,7 @@ def find_edge_times(
     """
     Backwards-compatible helper that matches the original function's behavior:
     - Returns only the FIRST crossing time as a Python float (NaN if none).
-    For all crossings use find_all_edge_times.
+    For all crossings, use internal _find_all_edge_times (not exported).
     """
     return find_first_edge_time(signal_view, value, edge=edge, atol=atol)
 
@@ -170,16 +178,16 @@ def time_between_signals(
     edge2: Edge = "rising",
     atol1: float = 1e-8,
     atol2: float = 1e-8
-) -> Optional[float]:
+) -> float:
     """
     Returns the absolute time difference between the first edge crossings
     in signal_view1 and signal_view2 at the specified thresholds and edge directions.
-    Returns None if either crossing is not found.
+    Returns NaN if either crossing is not found.
     """
     t1 = find_first_edge_time(signal_view1, value1, edge=edge1, atol=atol1)
     t2 = find_first_edge_time(signal_view2, value2, edge=edge2, atol=atol2)
     if np.isnan(t1) or np.isnan(t2):
-        return None
+        return float("nan")
     return float(abs(t2 - t1))
 
 # ------------------------ Change-start specialized finders ------------------- #
@@ -201,19 +209,15 @@ def find_step_start(
     min_low_samples: int = 3,
     min_high_samples: int = 3,
     atol: float = 1e-8
-) -> Optional[float]:
+) -> float:
     """
-    Detects the start time of a stable step change:
-    - Requires 'low' for >= min_low_samples, then a crossing at 'threshold',
-      then 'high' for >= min_high_samples after the crossing.
-    - If threshold is None, it is estimated from the first/last segments of the signal.
-    Returns the interpolated crossing time or None if not found.
-    Suitable for the red trace in your screenshots or when the green trace jumps and stays high.
+    Detects the start time of a stable step change and returns it as a float.
+    Returns NaN if not found.
     """
     x, y = _as_numpy_xy(signal_view)
     n = y.size
     if n < 2:
-        return None
+        return float("nan")
 
     if threshold is None:
         threshold = _auto_threshold_from_ends(y)
@@ -239,16 +243,16 @@ def find_step_start(
                 j_start = i + 1
                 j_end = min(n, j_start + min_high_samples)
                 if j_start >= n:
-                    return None
+                    return float("nan")
                 stable_high = (
                     np.all(y[j_start:j_end] >= thr_up) if edge == "rising"
                     else np.all(y[j_start:j_end] <= thr_dn)
                 )
                 if stable_high:
-                    return _interp_cross_time(x[i], x[i + 1], y[i], y[i + 1], threshold)
+                    return _interp_cross_time(x[i], x[i + 1], y[i], y[i + 1], float(threshold))
         i += 1
 
-    return None
+    return float("nan")
 
 def find_burst_start(
     signal_view,
@@ -258,31 +262,23 @@ def find_burst_start(
     require_edges_after: int = 3,
     window_after: float = 0.01,
     atol: float = 1e-8
-) -> Optional[float]:
+) -> float:
     """
-    Detects the start of a pulse train ("burst"):
-    - Finds all edges at 'threshold' (auto-estimated if None).
-    - Selects the first edge that follows a quiet gap >= min_quiet_gap with no edges.
-    - Optionally requires >= require_edges_after edges within 'window_after' after the start
-      to confirm it's a burst rather than a single glitch.
-
-    Returns the first burst edge time, or None if not found.
-    Suitable for the green trace when it starts toggling at high frequency after being quiet.
+    Detects the start of a pulse train ("burst") and returns the first burst edge time as float.
+    Returns NaN if not found.
     """
     x, y = _as_numpy_xy(signal_view)
     if threshold is None:
         threshold = _auto_threshold_from_ends(y)
 
-    edges = find_all_edge_times((x, y) if isinstance(signal_view, tuple) else signal_view, threshold, edge=edge, atol=atol)
+    edges = _find_all_edge_times(signal_view, float(threshold), edge=edge, atol=atol)
     if edges.size == 0:
-        return None
+        return float("nan")
 
     if edges.size == 1:
-        # If there is only one edge, it can be considered the burst start only
-        # if we don't need confirmation and any quiet gap requirement is trivially satisfied.
         if require_edges_after <= 0:
             return float(edges[0])
-        return None
+        return float("nan")
 
     gaps = np.diff(edges)
     idxs = np.flatnonzero(gaps >= float(min_quiet_gap))
@@ -296,7 +292,7 @@ def find_burst_start(
     count_after = int(np.sum((edges >= t0) & (edges <= t_end)))
     if count_after >= require_edges_after:
         return t0
-    return None
+    return float("nan")
 
 def detect_change_start(
     signal_view,
@@ -311,13 +307,10 @@ def detect_change_start(
     min_quiet_gap: float = 0.01,
     require_edges_after: int = 3,
     window_after: float = 0.01,
-) -> Optional[float]:
+) -> float:
     """
-    Unified entry to detect when the signal's behavior 'starts changing':
-    - mode="step": stable level change start time.
-    - mode="burst": start time of a pulse train after a quiet period.
-
-    Returns the timestamp or None if not found.
+    Unified entry to detect when the signal's behavior 'starts changing'.
+    Returns the timestamp as a float, or NaN if not found.
     """
     if mode == "step":
         return find_step_start(
@@ -343,39 +336,38 @@ def detect_change_start(
 
 # ------------------------------ Misc utilities ------------------------------ #
 
-def find_persistent_value(signal_view, value: float, atol: float = 1e-8) -> Optional[float]:
+def find_persistent_value(signal_view, value: float, atol: float = 1e-8) -> float:
     """
-    Returns the timestamp at which the signal becomes (and remains) at 'value'
-    for all subsequent samples. Useful for fault detection when the signal 'locks'
-    to a value. Returns None if no such persistent value is found.
+    Returns the timestamp (float) at which the signal becomes (and remains) at 'value'
+    for all subsequent samples. Returns NaN if no such persistent value is found.
     """
     x, y = _as_numpy_xy(signal_view)
     for i in range(y.size):
         if np.all(np.isclose(y[i:], value, atol=atol)):
             return float(x[i])
-    return None
+    return float("nan")
 
-def find_pattern(signal_view, pattern: List[float], atol: float = 1e-8) -> Optional[float]:
+def find_pattern(signal_view, pattern: List[float], atol: float = 1e-8) -> float:
     """
-    Finds the first timestamp where the signal matches a sequence of values in 'pattern'.
-    Returns the timestamp at the start of the match or None if not found.
-    Example: pattern=[2,3,5,0] -> returns timestamp where signal shows these values consecutively.
+    Finds the first timestamp (float) where the signal matches a sequence of values in 'pattern'.
+    Returns NaN if not found.
     """
     x, y = _as_numpy_xy(signal_view)
     n = len(pattern)
     if y.size < n:
-        return None
+        return float("nan")
     p = np.asarray(pattern, dtype=float)
     for i in range(y.size - n + 1):
         if np.all(np.isclose(y[i:i + n], p, atol=atol)):
             return float(x[i])
-    return None
+    return float("nan")
 
 def evaluate_signal_trend(signal_view, sample_count: int = 1) -> List[str]:
     """
     Evaluates the signal's trend ('increasing', 'decreasing', 'unchanged')
     using every 'sample_count'-th interval.
     Returns a list of trend labels with length len(y) - sample_count.
+    (No timestamp output here.)
     """
     _, y = _as_numpy_xy(signal_view)
     trends: List[str] = []
@@ -396,29 +388,25 @@ def find_signal_status(
     signal_view,
     check_type: Literal["stuck", "updating"] = "stuck",
     atol: float = 1e-8
-) -> Union[Tuple[float, float], None, bool]:
+) -> float:
     """
-    Checks if the signal is 'stuck' (stops updating and remains constant) or 'updating'.
-    Returns:
-      - If check_type == "stuck":
-          (value, timestamp) where the signal starts being stuck, or None if never stuck.
-      - If check_type == "updating":
-          True if signal never gets stuck, False if it gets stuck at some point.
+    Simplified to honor 'single float timestamp' rule.
+
+    - If check_type == "stuck":
+        Returns the timestamp (float) where the signal becomes stuck (constant thereafter),
+        or NaN if it never becomes stuck.
+    - If check_type == "updating":
+        There is no single 'time' output; returns NaN always.
     """
+    if check_type == "updating":
+        return float("nan")
+
     x, y = _as_numpy_xy(signal_view)
     N = y.size
     for i in range(N):
         if np.all(np.isclose(y[i:], y[i], atol=atol)):
-            if check_type == "stuck":
-                return float(y[i]), float(x[i])
-            elif check_type == "updating":
-                return False
-    if check_type == "stuck":
-        return None
-    elif check_type == "updating":
-        return True
-    # Fallback
-    return None
+            return float(x[i])
+    return float("nan")
 
 # --------------------------- In-place scaling helper ------------------------ #
 
@@ -466,22 +454,21 @@ def scale_rec_signal(view, factor: float = 1.0, offset: float = 0.0, round_to: O
 
 __all__ = [
     # Interpolation
-    "gettimestampbyvalue",
-    "getvaluebytimestamp",
-    # Edges
-    "find_all_edge_times",
-    "find_first_edge_time",
-    "find_edge_times",          # first edge (compat)
-    "time_between_signals",
-    # Change start
-    "find_step_start",
-    "find_burst_start",
-    "detect_change_start",
-    # Misc
-    "find_persistent_value",
-    "find_pattern",
-    "evaluate_signal_trend",
-    "find_signal_status",
+    "gettimestampbyvalue",      # float (NaN if not found)
+    "getvaluebytimestamp",      # Optional[float] (returns a value, not a time)
+    # Edges (single timestamp)
+    "find_first_edge_time",     # float (NaN if none)
+    "find_edge_times",          # float (alias of first edge)
+    "time_between_signals",     # float (NaN if either missing)
+    # Change start (single timestamp)
+    "find_step_start",          # float (NaN if none)
+    "find_burst_start",         # float (NaN if none)
+    "detect_change_start",      # float (NaN if none)
+    # Misc with time outputs simplified to float
+    "find_persistent_value",    # float (NaN if none)
+    "find_pattern",             # float (NaN if none)
+    "evaluate_signal_trend",    # List[str] (no time)
+    "find_signal_status",       # float (timestamp for 'stuck', NaN for 'updating')
     # Scaling
     "scale_rec_signal",
 ]
