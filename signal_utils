@@ -627,7 +627,7 @@ __all__ = [
 
 
 """
-Detect the timestamp where a repeating pattern in a signal becomes disturbed (fault start).
+Robustly detect when a repeating signal pattern becomes disturbed (fault start).
 
 You pass ONLY:
 - signal_view: object with .x (timestamps) and .y (values), or a tuple (x, y)
@@ -635,27 +635,19 @@ You pass ONLY:
 Returns:
 - float timestamp (seconds) of the first disturbance, or float("nan") if not detected.
 
-How it works (no pattern provided by user):
-1) Learn the repeating pattern from the first portion of the data (auto-learn window).
-2) Estimate the dominant period using frequency analysis (FFT) on the learned segment.
-3) Build a normalized template of one period by averaging several cycles.
-4) Slide a one-period window across the signal and compute normalized correlation
-   with the template. The fault time is the first time correlation drops and stays
-   below an adaptive threshold for a short hold-time.
+Key points
+- No pattern is provided by the user: the function auto-learns it from the first 30% of data.
+- Tolerant to small variations: uses robust statistics (median/MAD) to set adaptive thresholds.
+- Multiple fallbacks: FFT and autocorrelation for period; correlation-based detection and a
+  mean-level fallback to catch large DC/shape changes that still correlate moderately.
 
-Internal defaults (intentionally not user-tunable here):
-- learn_fraction = 0.30       # first 30% of the record used to learn the pattern
-- template_points = 128       # points in the template (phase grid)
-- corr_floor = 0.6            # minimal allowed correlation
-- thr_k = 3.0                 # threshold = baseline_mean - thr_k * baseline_std (robustly clipped)
-- hold_fraction_of_T = 0.15   # correlation must stay below threshold ~15% of a period
-- hop_fraction_of_T = 1/8     # stride for sliding windows relative to one period
+This is a drop-in replacement for earlier pattern_fault_time implementations that were too strict.
 """
 
 from typing import Tuple
 import numpy as np
 
-# ------------------------------ Helpers ------------------------------------ #
+# ------------------------------ Utilities ---------------------------------- #
 
 def _as_numpy_xy(signal_view) -> Tuple[np.ndarray, np.ndarray]:
     # Accept (x, y) tuple or object with .x/.y
@@ -665,101 +657,156 @@ def _as_numpy_xy(signal_view) -> Tuple[np.ndarray, np.ndarray]:
     else:
         x = np.asarray(getattr(signal_view, "x"), dtype=float)
         y = np.asarray(getattr(signal_view, "y"), dtype=float)
+
     if x.ndim != 1 or y.ndim != 1 or x.size != y.size:
         raise ValueError("signal_view.x and signal_view.y must be 1D arrays of the same length.")
-    # Remove NaNs (synchronized)
+
+    # Drop NaNs (synchronized)
     if np.isnan(x).any() or np.isnan(y).any():
-        mask = (~np.isnan(x)) & (~np.isnan(y))
-        x, y = x[mask], y[mask]
+        m = (~np.isnan(x)) & (~np.isnan(y))
+        x, y = x[m], y[m]
+
     # Ensure ascending time
     if x.size > 1 and not np.all(np.diff(x) >= 0):
         idx = np.argsort(x)
         x, y = x[idx], y[idx]
+
     return x, y
 
 def _uniform_resample(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
     """Resample to a uniform grid using linear interpolation. Returns (tu, yu, dt)."""
-    if x.size < 3:
+    if x.size < 4:
         return x, y, np.inf
     dt = float(np.median(np.diff(x)))
     if not np.isfinite(dt) or dt <= 0:
         return x, y, np.inf
-    tu = np.arange(x[0], x[-1], dt)
-    if tu.size < 3:
-        # fallback if range is too short
-        tu = x.copy()
-        yu = y.copy()
-    else:
-        yu = np.interp(tu, x, y)
+    tu = np.arange(x[0], x[-1] + 0.5 * dt, dt)
+    if tu.size < 4:
+        return x, y, np.inf
+    yu = np.interp(tu, x, y)
     return tu, yu, dt
 
+def _robust_mean_std(a: np.ndarray) -> Tuple[float, float]:
+    """Median and robust sigma estimate via MAD (scaled)."""
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return float("nan"), float("nan")
+    med = float(np.median(a))
+    mad = float(np.median(np.abs(a - med)))
+    sigma = 1.4826 * mad  # Gaussian consistent
+    return med, sigma
+
+# ---------------------------- Period estimation ----------------------------- #
+
 def _estimate_period_fft(y: np.ndarray, dt: float) -> float:
-    """Estimate dominant period (seconds) via FFT of zero-mean signal."""
+    """Estimate dominant period via FFT of zero-mean data; NaN if not reliable."""
     N = y.size
-    if N < 16 or not np.isfinite(dt) or dt == 0:
+    if N < 32 or not np.isfinite(dt) or dt <= 0:
         return np.nan
     z = y - np.mean(y)
+    if np.allclose(z, 0.0):
+        return np.nan
     Z = np.fft.rfft(z)
     f = np.fft.rfftfreq(N, dt)
     if f.size <= 1:
         return np.nan
-    # ignore DC
     mag = np.abs(Z)
-    mag[0] = 0.0
-    # Avoid very low or very high freqs: at least ~3 cycles in learn window and Nyquist-safe
+    mag[0] = 0.0  # ignore DC
+    # band: at least ~3 cycles in window and <= 90% Nyquist
     fmin = 3.0 / (N * dt)
-    fmax = 0.45 / dt  # 90% of Nyquist (conservative)
+    fmax = 0.45 / dt
     band = (f >= fmin) & (f <= fmax)
     if not np.any(band):
         return np.nan
-    k = int(np.argmax(mag[band]))
+    k = np.argmax(mag[band])
     idx = np.flatnonzero(band)[k]
     f0 = float(f[idx])
-    if f0 <= 0:
-        return np.nan
-    return 1.0 / f0
+    return np.nan if f0 <= 0 else (1.0 / f0)
 
-def _build_template(y: np.ndarray, samples_per_period: int, periods_to_average: int = 8, template_points: int = 128) -> np.ndarray:
-    """Average several cycles into a normalized template on a fixed phase grid."""
+def _estimate_period_acf(y: np.ndarray, dt: float) -> float:
+    """Estimate dominant period via autocorrelation peak; NaN if not reliable."""
+    N = y.size
+    if N < 64 or not np.isfinite(dt) or dt <= 0:
+        return np.nan
+    z = y - np.mean(y)
+    if np.allclose(z, 0.0):
+        return np.nan
+    # FFT-based autocorrelation
+    L = int(1 << (N - 1).bit_length())  # next pow2 for speed
+    Z = np.fft.rfft(z, n=2 * L)
+    ac = np.fft.irfft(np.abs(Z) ** 2)[:N]
+    ac = ac / max(ac[0], 1e-12)
+    # search lag range: 3 cycles min within window -> lag <= N/3
+    min_lag = 3
+    max_lag = N // 3
+    if max_lag <= min_lag:
+        return np.nan
+    lag = min_lag + int(np.argmax(ac[min_lag:max_lag]))
+    if lag <= 0:
+        return np.nan
+    return lag * dt
+
+def _best_period(y: np.ndarray, dt: float) -> float:
+    T_fft = _estimate_period_fft(y, dt)
+    if np.isfinite(T_fft):
+        return T_fft
+    return _estimate_period_acf(y, dt)
+
+# --------------------------- Template construction -------------------------- #
+
+def _align_and_average(y: np.ndarray, spp: int, max_periods: int = 12, template_points: int = 128) -> np.ndarray:
+    """
+    Build a normalized template by aligning up to max_periods cycles (length spp),
+    using circular shift to maximize correlation with the first cycle.
+    """
     n = y.size
-    spp = int(max(5, samples_per_period))
-    # collect up to periods_to_average full periods from the start
-    K = min(periods_to_average, n // spp - 1)
-    if K <= 0:
+    spp = int(max(8, spp))
+    K = min(max_periods, n // spp)
+    if K < 2:
         return np.array([], dtype=float)
-    phase_grid = np.linspace(0, 1, template_points, endpoint=False)
-    acc = np.zeros(template_points, dtype=float)
+
+    ref = y[0:spp].astype(float)
+    ref = ref - np.mean(ref)
+    s = float(np.std(ref))
+    if s > 0:
+        ref /= s
+
+    acc = np.zeros(spp, dtype=float)
     cnt = 0
     for i in range(K):
-        s = i * spp
-        e = s + spp
-        if e > n:
+        seg = y[i * spp:(i + 1) * spp].astype(float)
+        if seg.size != spp:
             break
-        seg = y[s:e]
-        # z-normalize segment to focus on shape
         seg = seg - np.mean(seg)
         std = float(np.std(seg))
         if std > 0:
             seg = seg / std
-        # map to phase grid
-        xi = np.linspace(0, 1, seg.size, endpoint=False)
-        acc += np.interp(phase_grid, xi, seg)
+        # align by circular shift maximizing correlation
+        c = np.fft.ifft(np.fft.fft(ref) * np.conj(np.fft.fft(seg))).real
+        shift = int(np.argmax(c)) % spp
+        seg_aligned = np.roll(seg, shift)
+        acc += seg_aligned
         cnt += 1
+
     if cnt == 0:
         return np.array([], dtype=float)
-    tpl = acc / cnt
-    # unit-norm template
+
+    avg = acc / cnt
+    # resample to a fixed phase grid for stable comparison
+    xi = np.linspace(0, 1, spp, endpoint=False)
+    phase_grid = np.linspace(0, 1, template_points, endpoint=False)
+    tpl = np.interp(phase_grid, xi, avg)
+    # unit norm
     norm = float(np.linalg.norm(tpl))
     if norm > 0:
         tpl = tpl / norm
     return tpl
 
-def _window_corr(y: np.ndarray, i: int, spp: int, template: np.ndarray) -> float:
-    """Compute normalized correlation between signal window and template."""
+def _window_correlation(y: np.ndarray, i: int, spp: int, template: np.ndarray) -> float:
+    """Normalized correlation of one window (length spp) to template (phase grid)."""
     seg = y[i:i + spp]
     if seg.size != spp:
         return np.nan
-    # z-normalize segment
     seg = seg - np.mean(seg)
     std = float(np.std(seg))
     if std == 0:
@@ -768,92 +815,95 @@ def _window_corr(y: np.ndarray, i: int, spp: int, template: np.ndarray) -> float
     # resample to template length
     xi = np.linspace(0, 1, seg.size, endpoint=False)
     seg_t = np.interp(np.linspace(0, 1, template.size, endpoint=False), xi, seg)
-    # normalized dot (template already unit norm)
     denom = float(np.linalg.norm(seg_t))
     if denom == 0:
         return 0.0
     return float(np.dot(seg_t, template) / denom)
 
-# ------------------------------ Public API --------------------------------- #
+# ------------------------------ Main detector ------------------------------- #
 
 def pattern_fault_time(signal_view) -> float:
     """
-    Return the first timestamp (float seconds) where the learned repeating pattern is disturbed.
-    Returns float('nan') if it cannot be determined.
+    Return the first timestamp (float seconds) where the auto-learned repeating pattern
+    is disturbed and stays disturbed briefly. Returns float('nan') if not detected.
     """
     x, y = _as_numpy_xy(signal_view)
-    if x.size < 64:
+    if x.size < 128:
         return float("nan")
 
-    # 1) Uniform resample
+    # Uniform resample
     tu, yu, dt = _uniform_resample(x, y)
-    if not np.isfinite(dt) or tu.size < 64:
+    if not np.isfinite(dt) or tu.size < 128:
         return float("nan")
 
-    # 2) Learn from the first portion
+    # Learn window
     learn_fraction = 0.30
     N = tu.size
-    N_learn = max(64, int(N * learn_fraction))
-    if N_learn >= N:
-        N_learn = max(64, N // 2)
+    N_learn = max(128, int(N * learn_fraction))
+    N_learn = min(N_learn, max(128, N // 2))
     yL = yu[:N_learn]
 
-    # 3) Estimate period and samples per period
-    T = _estimate_period_fft(yL, dt)
+    # Period estimate
+    T = _best_period(yL, dt)
     if not np.isfinite(T):
         return float("nan")
     spp = int(round(T / dt))
-    if spp < 8 or spp > N_learn // 2:
-        # unreasonable estimate; bail
+    if spp < 8:
+        return float("nan")
+    if spp > N_learn // 2:
+        # Estimated period too long for reliable learning
         return float("nan")
 
-    # 4) Build template from learned cycles
-    template_points = 128
-    tpl = _build_template(yL, spp, periods_to_average=8, template_points=template_points)
-    if tpl.size == 0:
+    # Template
+    template = _align_and_average(yL, spp, max_periods=12, template_points=128)
+    if template.size == 0:
         return float("nan")
 
-    # 5) Sliding correlation
-    hop = max(1, int(round(spp * (1.0 / 8.0))))
-    hold_windows = max(2, int(round((spp * 0.15) / hop)))  # ~15% of a period
+    # Sliding correlation (tolerant)
+    hop = max(1, int(round(spp / 8)))         # ~8 hops per period
+    hold_windows = max(2, int(round(0.15 * spp / hop)))  # ~15% of a period
     corrs = []
     times = []
+    means = []
     for i in range(0, N - spp, hop):
-        c = _window_corr(yu, i, spp, tpl)
+        c = _window_correlation(yu, i, spp, template)
         corrs.append(c)
+        means.append(float(np.mean(yu[i:i + spp])))
         times.append(tu[i + spp // 2])
     corrs = np.asarray(corrs, dtype=float)
+    means = np.asarray(means, dtype=float)
     times = np.asarray(times, dtype=float)
     if times.size == 0:
         return float("nan")
 
-    # 6) Adaptive threshold from learning region windows
-    learn_mask = times <= tu[N_learn - 1] if N_learn < tu.size else np.ones_like(times, dtype=bool)
+    # Baseline stats from learn region
+    learn_mask = times <= tu[min(N_learn - 1, N - 1)]
     if not np.any(learn_mask):
         return float("nan")
-    base = corrs[learn_mask]
-    # robust stats
-    base = base[np.isfinite(base)]
-    if base.size < 8:
-        return float("nan")
-    base_mean = float(np.mean(base))
-    base_std = float(np.std(base))
-    thr_k = 3.0
-    corr_floor = 0.6
-    thr = min(base_mean - thr_k * base_std, corr_floor)
+    base_corr = corrs[learn_mask]
+    base_mean = means[learn_mask]
 
-    # 7) Find first sustained drop below threshold after the learn window
-    post_mask = ~learn_mask
-    idxs = np.flatnonzero(post_mask)
-    if idxs.size == 0:
+    mc, sc = _robust_mean_std(base_corr)
+    mm, sm = _robust_mean_std(base_mean)
+    if not np.isfinite(mc) or not np.isfinite(sc) or not np.isfinite(mm) or not np.isfinite(sm):
         return float("nan")
 
-    start_idx = int(idxs[0])
-    bad = corrs < thr
-    # rolling hold
+    # Adaptive thresholds (tolerant)
+    # Correlation should remain close to baseline; trigger when it drops significantly.
+    # Use a floor so we don't require extremely low correlation to trigger.
+    corr_floor = max(0.3, mc - 3.0 * sc)  # tolerant: allow some variation
+    # Mean-level fallback: large DC shift indicates disturbance even if shape remains similar.
+    mean_dev_thr = max(3.5 * sm, 0.02 * max(1.0, abs(mm)))  # scale-aware
+
+    # Start scanning after learning window
+    j0 = int(np.searchsorted(times, tu[min(N_learn - 1, N - 1)], side="right"))
+    bad_corr = corrs < corr_floor
+    bad_mean = np.abs(means - mm) > mean_dev_thr
+
+    # Require sustained violation by either criterion
     run = 0
-    for j in range(start_idx, bad.size):
-        if bad[j]:
+    for j in range(j0, times.size):
+        if bad_corr[j] or bad_mean[j]:
             run += 1
             if run >= hold_windows:
                 return float(times[j - hold_windows + 1])
