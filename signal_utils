@@ -450,6 +450,163 @@ def scale_rec_signal(view, factor: float = 1.0, offset: float = 0.0, round_to: O
 
     return view
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+Burst change timestamp detector (single float output).
+
+You pass ONLY:
+- signal_view: object with .x (timestamps) and .y (values), or a tuple (x, y)
+- value: float threshold
+- atol: float hysteresis tolerance
+- edge: "rising" or "falling"
+- burst: bool (kept for signature clarity; always treated as burst detection)
+
+Behavior
+- edge == "rising": return the start time of the burst (first edge where dense toggling begins)
+- edge == "falling": return the end time of the burst (last edge where dense toggling ends)
+
+Returns
+- float timestamp in seconds
+- float("nan") if not detected
+
+Notes
+- No extra tuning parameters are accepted; adaptive detection is used internally.
+"""
+
+from typing import Tuple, Literal
+import numpy as np
+
+Edge = Literal["rising", "falling"]
+
+# ------------------------------ Small helpers ------------------------------ #
+
+def _as_numpy_xy(signal_view) -> Tuple[np.ndarray, np.ndarray]:
+    """Return x, y as numpy arrays and ensure time is ascending."""
+    if isinstance(signal_view, tuple) and len(signal_view) == 2:
+        x = np.asarray(signal_view[0], dtype=float)
+        y = np.asarray(signal_view[1], dtype=float)
+    else:
+        x = np.asarray(getattr(signal_view, "x"), dtype=float)
+        y = np.asarray(getattr(signal_view, "y"), dtype=float)
+    if x.ndim != 1 or y.ndim != 1 or x.size != y.size:
+        raise ValueError("signal_view.x and signal_view.y must be 1D arrays of the same length.")
+    if x.size > 1 and not np.all(np.diff(x) >= 0):
+        idx = np.argsort(x)
+        x, y = x[idx], y[idx]
+    return x, y
+
+def _interp_cross_time(x0: float, x1: float, y0: float, y1: float, thr: float) -> float:
+    """Linear interpolation for threshold crossing."""
+    if y1 == y0:
+        return float(x0)
+    return float(x0 + (x1 - x0) * (thr - y0) / (y1 - y0))
+
+def _find_all_edge_times(signal_view, threshold: float, edge: Edge, atol: float) -> np.ndarray:
+    """All crossing times using hysteresis band [thr-atol, thr+atol]."""
+    x, y = _as_numpy_xy(signal_view)
+    if x.size < 2:
+        return np.array([], dtype=float)
+    thr_up = float(threshold) + float(atol)
+    thr_dn = float(threshold) - float(atol)
+    if edge == "rising":
+        mask = (y[:-1] <= thr_dn) & (y[1:] >= thr_up)
+    else:
+        mask = (y[:-1] >= thr_up) & (y[1:] <= thr_dn)
+    idxs = np.flatnonzero(mask)
+    if idxs.size == 0:
+        return np.array([], dtype=float)
+    times = np.empty(idxs.size, dtype=float)
+    for k, i in enumerate(idxs):
+        times[k] = _interp_cross_time(x[i], x[i + 1], y[i], y[i + 1], float(threshold))
+    return times
+
+def _dense_runs_from_edges(edges: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Identify dense toggling runs from edge times using an adaptive gap threshold.
+    Returns (run_starts, run_ends, gap_threshold).
+    run_starts/ends are indices into the 'gaps' array (length edges.size-1).
+    A run of gaps[i0..i1] corresponds to edges[i0]..edges[i1+1].
+    """
+    if edges.size < 3:
+        return np.array([], dtype=int), np.array([], dtype=int), float("nan")
+    gaps = np.diff(edges)
+    if gaps.size == 0:
+        return np.array([], dtype=int), np.array([], dtype=int), float("nan")
+
+    med = float(np.median(gaps))
+    p20 = float(np.percentile(gaps, 20))
+    # Adaptive threshold: favor smaller (denser) gap criterion.
+    thr = max(1e-12, min(med * 0.7, p20 * 1.5))
+
+    small = gaps <= thr
+    if not np.any(small):
+        return np.array([], dtype=int), np.array([], dtype=int), thr
+
+    # Find contiguous True runs
+    # Convert boolean runs to start/end indices on 'gaps'
+    diffs = np.diff(small.astype(int))
+    starts = np.flatnonzero(np.concatenate(([small[0]], diffs == 1)))
+    ends = np.flatnonzero(np.concatenate(((diffs == -1), [small[-1]])))  # inclusive ends on gaps index
+    # Require at least 2 small gaps in a run (=> at least 3 edges in that dense segment)
+    valid = (ends - starts + 1) >= 2
+    return starts[valid], ends[valid], thr
+
+# --------------------------------- Public ---------------------------------- #
+
+def burst_time(
+    signal_view,
+    value: float,
+    atol: float,
+    edge: Edge,
+    burst: bool = True,  # kept for signature clarity; always treated as burst detection
+) -> float:
+    """
+    Single-timestamp burst detector.
+
+    - edge='rising'  -> returns the burst START time (first edge of dense run)
+    - edge='falling' -> returns the burst END time   (last edge of dense run)
+
+    Returns float('nan') if not detected.
+    """
+    edges = _find_all_edge_times(signal_view, value, edge, atol)
+    if edges.size < 3:
+        return float("nan")
+
+    run_starts, run_ends, _thr = _dense_runs_from_edges(edges)
+    if run_starts.size == 0:
+        return float("nan")
+
+    if edge == "rising":
+        # First dense run start -> edges[run_start]
+        i0 = int(run_starts[0])
+        return float(edges[i0])
+    else:
+        # Last dense run end -> edges[run_end + 1]
+        i1 = int(run_ends[-1])
+        j = i1 + 1
+        if j < edges.size:
+            return float(edges[j])
+        # Fallback safety (shouldn't happen): use last edge
+        return float(edges[-1])
+
+__all__ = ["burst_time"]
+
 # ------------------------------- Public API -------------------------------- #
 
 __all__ = [
