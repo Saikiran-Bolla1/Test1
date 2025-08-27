@@ -626,23 +626,25 @@ __all__ = [
 
 
 """
-Detect the timestamp of a MAJOR disturbance in a repeating signal pattern (shape-only).
+Detect the timestamp of a MAJOR disturbance in a repeating signal pattern.
 
-What this version changes vs your working one:
-- Ignores minute offset and amplitude changes by z-normalizing each analysis window.
-- Makes detection phase-invariant using circular correlation (robust to small timing jitter).
-- Returns sub-sample accurate time by interpolating the correlation-threshold crossing.
-- Keeps the same public function name/signature for drop-in replacement.
+You pass ONLY:
+- signal_view: object with .x (timestamps) and .y (values), or a tuple (x, y)
 
-Public API
-- pattern_major_fault_time(signal_view) -> float
-  signal_view: object with .x (timestamps) and .y (values), or a tuple (x, y)
-  returns: first timestamp (seconds) of a major pattern disturbance, or float("nan")
+Returns:
+- float timestamp (seconds) of the first major disturbance, or float("nan") if none.
 
-Internal policy (no user tuning):
-- Learn template from the first ~30% (capped at half) of the record.
-- Threshold: correlation must drop by >= 5σ from baseline and be < 0.40.
-- Sustained: about 50% of a period worth of consecutive windows.
+What counts as a MAJOR change (minute changes ignored):
+- Large, sustained drop in pattern correlation vs a learned template (>= 5σ and below 0.4).
+- OR a sustained, large deviation (>= 6σ) in at least two of these features simultaneously:
+  mean level, standard deviation, peak-to-peak amplitude.
+
+Additional guards:
+- Auto-learns the template from the first 30% (max half) of the recording.
+- Robust stats via median/MAD (σ≈1.4826*MAD).
+- Sustained = roughly 50% of one period worth of consecutive windows.
+
+No user tuning parameters are exposed.
 """
 
 from typing import Tuple
@@ -687,18 +689,6 @@ def _uniform_resample(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndar
     yu = np.interp(tu, x, y)
     return tu, yu, dt
 
-def _median_filter(v: np.ndarray, k: int = 5) -> np.ndarray:
-    """Odd-length median filter with reflect padding."""
-    if k <= 1 or v.size == 0:
-        return v.copy()
-    k = int(k + (k % 2 == 0))  # ensure odd
-    r = k // 2
-    pad = np.pad(v, (r, r), mode="reflect")
-    out = np.empty_like(v)
-    for i in range(v.size):
-        out[i] = np.median(pad[i:i + k])
-    return out
-
 def _robust_mean_std(a: np.ndarray) -> Tuple[float, float]:
     """Median and robust sigma estimate via MAD (scaled)."""
     a = a[np.isfinite(a)]
@@ -707,9 +697,9 @@ def _robust_mean_std(a: np.ndarray) -> Tuple[float, float]:
     med = float(np.median(a))
     mad = float(np.median(np.abs(a - med)))
     sigma = 1.4826 * mad  # Gaussian consistent
+    # Avoid zero sigma
     if not np.isfinite(sigma) or sigma == 0:
-        s = float(np.std(a))
-        sigma = s if s > 0 else 1e-12
+        sigma = float(np.std(a)) if np.std(a) > 0 else 1e-12
     return med, sigma
 
 # ---------------------------- Period estimation ----------------------------- #
@@ -770,8 +760,8 @@ def _best_period(y: np.ndarray, dt: float) -> float:
 
 def _align_and_average(y: np.ndarray, spp: int, max_periods: int = 12, template_points: int = 128) -> np.ndarray:
     """
-    Build a SHAPE-ONLY template by aligning cycles (length spp) and z-normalizing each.
-    Returns a unit-norm template sampled on a fixed phase grid (length template_points).
+    Build a normalized template by aligning up to max_periods cycles (length spp),
+    using circular shift to maximize correlation with the first cycle.
     """
     n = y.size
     spp = int(max(8, spp))
@@ -791,12 +781,11 @@ def _align_and_average(y: np.ndarray, spp: int, max_periods: int = 12, template_
         seg = y[i * spp:(i + 1) * spp].astype(float)
         if seg.size != spp:
             break
-        # z-normalize to remove offset and amplitude
         seg = seg - np.mean(seg)
         std = float(np.std(seg))
         if std > 0:
             seg = seg / std
-        # circularly align to reference (phase-invariant)
+        # align by circular shift maximizing correlation
         c = np.fft.ifft(np.fft.fft(ref) * np.conj(np.fft.fft(seg))).real
         shift = int(np.argmax(c)) % spp
         seg_aligned = np.roll(seg, shift)
@@ -807,7 +796,7 @@ def _align_and_average(y: np.ndarray, spp: int, max_periods: int = 12, template_
         return np.array([], dtype=float)
 
     avg = acc / cnt
-    # resample to a fixed phase grid
+    # resample to a fixed phase grid for stable comparison
     xi = np.linspace(0, 1, spp, endpoint=False)
     phase_grid = np.linspace(0, 1, template_points, endpoint=False)
     tpl = np.interp(phase_grid, xi, avg)
@@ -817,84 +806,56 @@ def _align_and_average(y: np.ndarray, spp: int, max_periods: int = 12, template_
         tpl = tpl / norm
     return tpl
 
-# ------------------------- Shape-only correlation --------------------------- #
-
-def _phase_invariant_corr(seg: np.ndarray, template: np.ndarray) -> float:
+def _window_features(y: np.ndarray, i: int, spp: int, template: np.ndarray) -> Tuple[float, float, float, float]:
     """
-    Phase-invariant, offset/scale-invariant correlation between a segment and template.
-    Assumes 'seg' is one period of samples (length ~ template length).
+    Compute window features for y[i:i+spp]:
+    - correlation to template (normalized)
+    - mean
+    - std
+    - peak-to-peak amplitude
     """
-    # z-normalize segment (remove offset and amplitude)
-    seg = seg - np.mean(seg)
+    seg = y[i:i + spp]
+    if seg.size != spp:
+        return np.nan, np.nan, np.nan, np.nan
+    m = float(np.mean(seg))
     s = float(np.std(seg))
+    a = float(np.max(seg) - np.min(seg))
+    # correlation
+    z = seg - m
     if s > 0:
-        seg = seg / s
-    # resample seg to template length
-    L = template.size
+        z = z / s
     xi = np.linspace(0, 1, seg.size, endpoint=False)
-    seg_t = np.interp(np.linspace(0, 1, L, endpoint=False), xi, seg)
-    # normalize to unit norm
+    seg_t = np.interp(np.linspace(0, 1, template.size, endpoint=False), xi, z)
     denom = float(np.linalg.norm(seg_t))
     if denom == 0:
-        return 0.0
-    seg_t = seg_t / denom
-    # circular cross-correlation (dot product at all shifts)
-    c = np.fft.ifft(np.fft.fft(seg_t) * np.conj(np.fft.fft(template))).real
-    c = np.clip(c, -1.0, 1.0)
-    return float(np.max(c))
-
-def _first_sustained_crossing_time(times: np.ndarray, series: np.ndarray, threshold: float, hold_windows: int, start_idx: int) -> float:
-    """
-    Find first time when series stays below threshold for 'hold_windows' consecutive steps.
-    Returns sub-sample estimate by linearly interpolating the threshold crossing.
-    """
-    below = series < threshold
-    run = 0
-    for j in range(start_idx, series.size):
-        if below[j]:
-            run += 1
-            if run >= hold_windows:
-                s = j - hold_windows + 1
-                k = s - 1
-                while k >= 0 and below[k]:
-                    k -= 1
-                if k < 0:
-                    return float(times[s])
-                y0, y1 = float(series[k]), float(series[k + 1])
-                t0, t1 = float(times[k]), float(times[k + 1])
-                if y1 == y0 or t1 == t0:
-                    return float(times[s])
-                alpha = (threshold - y0) / (y1 - y0)
-                alpha = float(np.clip(alpha, 0.0, 1.0))
-                return float(t0 + alpha * (t1 - t0))
-        else:
-            run = 0
-    return float("nan")
+        c = 0.0
+    else:
+        c = float(np.dot(seg_t, template) / denom)
+    return c, m, s, a
 
 # ------------------------------ Main detector ------------------------------- #
 
 def pattern_major_fault_time(signal_view) -> float:
     """
-    Return the first timestamp (float seconds) where a MAJOR pattern disturbance occurs.
-    Minute offset/scale changes are ignored; detection uses shape-only correlation.
-    Returns float('nan') if none detected.
+    Return the first timestamp (float seconds) where a MAJOR disturbance occurs.
+    Minor changes are ignored by design. Returns float('nan') if none detected.
     """
     x, y = _as_numpy_xy(signal_view)
     if x.size < 256:
         return float("nan")
 
-    # Resample to uniform grid for stable windowing/interpolation
+    # Uniform resample
     tu, yu, dt = _uniform_resample(x, y)
     if not np.isfinite(dt) or tu.size < 256:
         return float("nan")
 
-    # Learn baseline pattern from the first ~30% (but not more than half)
+    # Learn window
     learn_fraction = 0.30
     N = tu.size
     N_learn = min(max(256, int(N * learn_fraction)), max(256, N // 2))
     yL = yu[:N_learn]
 
-    # Estimate period and samples per period
+    # Period estimate
     T = _best_period(yL, dt)
     if not np.isfinite(T):
         return float("nan")
@@ -902,48 +863,71 @@ def pattern_major_fault_time(signal_view) -> float:
     if spp < 12 or spp > N_learn // 2:
         return float("nan")
 
-    # Build shape-only template
+    # Template
     template = _align_and_average(yL, spp, max_periods=12, template_points=128)
     if template.size == 0:
         return float("nan")
 
-    # Slide one-period windows across full record and compute shape-only correlation
+    # Sliding features
     hop = max(1, int(round(spp / 8)))  # ~8 hops per period
     times = []
-    corrs = []
+    corr = []
+    meanv = []
+    stdv = []
+    ampv = []
     for i in range(0, N - spp, hop):
-        seg = yu[i:i + spp]
-        c = _phase_invariant_corr(seg, template)
+        c, m, s, a = _window_features(yu, i, spp, template)
         times.append(tu[i + spp // 2])
-        corrs.append(c)
+        corr.append(c)
+        meanv.append(m)
+        stdv.append(s)
+        ampv.append(a)
     times = np.asarray(times, dtype=float)
-    corrs = np.asarray(corrs, dtype=float)
+    corr = np.asarray(corr, dtype=float)
+    meanv = np.asarray(meanv, dtype=float)
+    stdv = np.asarray(stdv, dtype=float)
+    ampv = np.asarray(ampv, dtype=float)
     if times.size == 0:
         return float("nan")
 
-    # Smooth correlation lightly to suppress minute blips
-    corrs_s = _median_filter(corrs, k=5)
-
-    # Baseline correlation stats from the learn region only
+    # Baseline (learn region)
     learn_end_time = tu[min(N_learn - 1, N - 1)]
     learn_mask = times <= learn_end_time
     if not np.any(learn_mask):
         return float("nan")
 
-    mc, sc = _robust_mean_std(corrs_s[learn_mask])
-    if not np.isfinite(mc) or not np.isfinite(sc):
+    mc, sc = _robust_mean_std(corr[learn_mask])
+    mm, sm = _robust_mean_std(meanv[learn_mask])
+    ms, ss = _robust_mean_std(stdv[learn_mask])
+    ma, sa = _robust_mean_std(ampv[learn_mask])
+
+    if not all(np.isfinite(v) for v in (mc, sc, mm, sm, ms, ss, ma, sa)):
         return float("nan")
 
-    # Robust threshold: require a large drop and low absolute correlation
-    # This ignores minute changes while capturing true pattern disturbances.
-    corr_thr = min(mc - 5.0 * sc, 0.40)
+    # Major-change thresholds (strict, to ignore minute changes)
+    corr_thr = min(mc - 5.0 * sc, 0.40)   # must drop a lot and be fairly low
+    z_mean = np.abs(meanv - mm) / max(sm, 1e-12)
+    z_std  = np.abs(stdv - ms)  / max(ss, 1e-12)
+    z_amp  = np.abs(ampv - ma)  / max(sa, 1e-12)
 
-    # Require sustained violation for about half a period
+    # Combined major-event flag:
+    # - Either correlation massively drops, OR at least two of the feature z-scores exceed 6.
+    major_flag = (corr < corr_thr) | (
+        ((z_mean > 6.0).astype(int) + (z_std > 6.0).astype(int) + (z_amp > 6.0).astype(int)) >= 2
+    )
+
+    # Require sustained violation ~50% of a period
     hold_windows = max(3, int(round(0.5 * spp / hop)))
     j0 = int(np.searchsorted(times, learn_end_time, side="right"))
+    run = 0
+    for j in range(j0, times.size):
+        if major_flag[j]:
+            run += 1
+            if run >= hold_windows:
+                return float(times[j - hold_windows + 1])
+        else:
+            run = 0
 
-    # Find first sustained crossing time (interpolated)
-    t_change = _first_sustained_crossing_time(times, corrs_s, corr_thr, hold_windows, j0)
-    return float(t_change)
+    return float("nan")
 
 __all__ = ["pattern_major_fault_time"]
