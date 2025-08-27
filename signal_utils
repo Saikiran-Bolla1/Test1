@@ -625,9 +625,8 @@ __all__ = [
 
 
 
-
 """
-Detect the timestamp of a MAJOR disturbance in a repeating signal pattern (sub-sample precision).
+Detect the timestamp of a MAJOR disturbance in a repeating signal pattern.
 
 You pass ONLY:
 - signal_view: object with .x (timestamps) and .y (values), or a tuple (x, y)
@@ -635,17 +634,15 @@ You pass ONLY:
 Returns:
 - float timestamp (seconds) of the first major disturbance, or float("nan") if none.
 
-Major change definition (minute changes ignored):
-- A large, sustained drop in pattern correlation vs a learned template (>= 5σ drop and also below 0.40),
-  OR
-- A sustained, large deviation (>= 6σ) in at least two of: window mean, window std, peak-to-peak amplitude.
+What counts as a MAJOR change (minute changes ignored):
+- Large, sustained drop in pattern correlation vs a learned template (>= 5σ and below 0.4).
+- OR a sustained, large deviation (>= 6σ) in at least two of these features simultaneously:
+  mean level, standard deviation, peak-to-peak amplitude.
 
-Improvements over previous version:
-- Uniform resampling for clean interpolation.
-- Small, robust median smoothing of the feature series to ignore minute blips.
-- Sub-sample-accurate fault time by interpolating:
-  - the exact crossing of correlation threshold, and
-  - the exact crossing of CUSUM decision thresholds.
+Additional guards:
+- Auto-learns the template from the first 30% (max half) of the recording.
+- Robust stats via median/MAD (σ≈1.4826*MAD).
+- Sustained = roughly 50% of one period worth of consecutive windows.
 
 No user tuning parameters are exposed.
 """
@@ -702,21 +699,8 @@ def _robust_mean_std(a: np.ndarray) -> Tuple[float, float]:
     sigma = 1.4826 * mad  # Gaussian consistent
     # Avoid zero sigma
     if not np.isfinite(sigma) or sigma == 0:
-        s = float(np.std(a))
-        sigma = s if s > 0 else 1e-12
+        sigma = float(np.std(a)) if np.std(a) > 0 else 1e-12
     return med, sigma
-
-def _median_filter(v: np.ndarray, k: int = 5) -> np.ndarray:
-    """Odd-length median filter with reflect padding."""
-    if k <= 1 or v.size == 0:
-        return v.copy()
-    k = int(k + (k % 2 == 0))  # ensure odd
-    r = k // 2
-    pad = np.pad(v, (r, r), mode="reflect")
-    out = np.empty_like(v)
-    for i in range(v.size):
-        out[i] = np.median(pad[i:i + k])
-    return out
 
 # ---------------------------- Period estimation ----------------------------- #
 
@@ -824,7 +808,7 @@ def _align_and_average(y: np.ndarray, spp: int, max_periods: int = 12, template_
 
 def _window_features(y: np.ndarray, i: int, spp: int, template: np.ndarray) -> Tuple[float, float, float, float]:
     """
-    Features for window y[i:i+spp]:
+    Compute window features for y[i:i+spp]:
     - correlation to template (normalized)
     - mean
     - std
@@ -836,98 +820,18 @@ def _window_features(y: np.ndarray, i: int, spp: int, template: np.ndarray) -> T
     m = float(np.mean(seg))
     s = float(np.std(seg))
     a = float(np.max(seg) - np.min(seg))
-    # normalized correlation
+    # correlation
     z = seg - m
     if s > 0:
         z = z / s
     xi = np.linspace(0, 1, seg.size, endpoint=False)
     seg_t = np.interp(np.linspace(0, 1, template.size, endpoint=False), xi, z)
     denom = float(np.linalg.norm(seg_t))
-    c = float(np.dot(seg_t, template) / denom) if denom > 0 else 0.0
+    if denom == 0:
+        c = 0.0
+    else:
+        c = float(np.dot(seg_t, template) / denom)
     return c, m, s, a
-
-# ------------------------- Sustained crossing (interpolated) ---------------- #
-
-def _first_sustained_crossing_time(times: np.ndarray, series: np.ndarray, threshold: float, below: bool, hold_windows: int, start_idx: int) -> float:
-    """
-    Find the first time when series stays below/above threshold for 'hold_windows' consecutive steps.
-    Returns sub-sample estimate by linearly interpolating the threshold crossing at the start of the run.
-    """
-    cond = (series < threshold) if below else (series > threshold)
-    run = 0
-    for j in range(start_idx, series.size):
-        if cond[j]:
-            run += 1
-            if run >= hold_windows:
-                s = j - hold_windows + 1  # start index of sustained run
-                # find the last index before 's' where condition was not met
-                k = s - 1
-                while k >= 0 and cond[k]:
-                    k -= 1
-                if k < 0:
-                    return float(times[s])
-                # interpolate between k and k+1 crossing the threshold
-                y0 = float(series[k])
-                y1 = float(series[k + 1])
-                t0 = float(times[k])
-                t1 = float(times[k + 1])
-                if y1 == y0 or t1 == t0:
-                    return float(times[s])
-                # solve y = threshold for linear segment
-                alpha = (threshold - y0) / (y1 - y0)
-                alpha = float(np.clip(alpha, 0.0, 1.0))
-                return float(t0 + alpha * (t1 - t0))
-        else:
-            run = 0
-    return float("nan")
-
-# ---------------------------------- CUSUM ----------------------------------- #
-
-def _cusum_first_time_interpolated(series: np.ndarray, times: np.ndarray, baseline: float, sigma: float, k_sigma: float, h_sigma: float, start_idx: int) -> float:
-    """
-    One-sided two-direction CUSUM with linear interpolation of threshold crossing.
-    Returns first time where either pos or neg CUSUM crosses h_sigma*sigma, else NaN.
-    """
-    if not np.isfinite(sigma) or sigma == 0:
-        return float("nan")
-    k = k_sigma * sigma
-    h = h_sigma * sigma
-
-    s_pos = 0.0
-    s_neg = 0.0
-    last_s_pos = 0.0
-    last_s_neg = 0.0
-    last_t = float(times[start_idx]) if start_idx < times.size else float("nan")
-
-    for j in range(start_idx, series.size):
-        x = float(series[j]) - baseline
-        last_s_pos, last_s_neg = s_pos, s_neg
-        last_t = float(times[j])
-        s_pos = max(0.0, s_pos + (x - k))
-        s_neg = min(0.0, s_neg + (x + k))
-
-        # Positive crossing
-        if last_s_pos <= h and s_pos > h:
-            # interpolate last_t_prev to current time; assume linear change from last to current
-            t_prev = float(times[max(j - 1, 0)])
-            y0, y1 = last_s_pos, s_pos
-            if y1 != y0 and last_t != t_prev:
-                alpha = (h - y0) / (y1 - y0)
-                alpha = float(np.clip(alpha, 0.0, 1.0))
-                return float(t_prev + alpha * (last_t - t_prev))
-            return float(last_t)
-
-        # Negative crossing (use magnitude)
-        if abs(last_s_neg) <= h and abs(s_neg) > h:
-            t_prev = float(times[max(j - 1, 0)])
-            y0, y1 = abs(last_s_neg), abs(s_neg)
-            if y1 != y0 and last_t != t_prev:
-                alpha = (h - y0) / (y1 - y0)
-                alpha = float(np.clip(alpha, 0.0, 1.0))
-                return float(t_prev + alpha * (last_t - t_prev))
-            return float(last_t)
-
-    return float("nan")
 
 # ------------------------------ Main detector ------------------------------- #
 
@@ -964,7 +868,7 @@ def pattern_major_fault_time(signal_view) -> float:
     if template.size == 0:
         return float("nan")
 
-    # Sliding features across full record
+    # Sliding features
     hop = max(1, int(round(spp / 8)))  # ~8 hops per period
     times = []
     corr = []
@@ -986,55 +890,44 @@ def pattern_major_fault_time(signal_view) -> float:
     if times.size == 0:
         return float("nan")
 
-    # Robust median smoothing to ignore minute changes/blips (very small window)
-    corr_s = _median_filter(corr, k=5)
-    mean_s = _median_filter(meanv, k=5)
-    std_s  = _median_filter(stdv,  k=5)
-    amp_s  = _median_filter(ampv,  k=5)
-
     # Baseline (learn region)
     learn_end_time = tu[min(N_learn - 1, N - 1)]
     learn_mask = times <= learn_end_time
     if not np.any(learn_mask):
         return float("nan")
 
-    mc, sc = _robust_mean_std(corr_s[learn_mask])
-    mm, sm = _robust_mean_std(mean_s[learn_mask])
-    ms, ss = _robust_mean_std(std_s[learn_mask])
-    ma, sa = _robust_mean_std(amp_s[learn_mask])
+    mc, sc = _robust_mean_std(corr[learn_mask])
+    mm, sm = _robust_mean_std(meanv[learn_mask])
+    ms, ss = _robust_mean_std(stdv[learn_mask])
+    ma, sa = _robust_mean_std(ampv[learn_mask])
+
     if not all(np.isfinite(v) for v in (mc, sc, mm, sm, ms, ss, ma, sa)):
         return float("nan")
 
     # Major-change thresholds (strict, to ignore minute changes)
     corr_thr = min(mc - 5.0 * sc, 0.40)   # must drop a lot and be fairly low
-    z_mean = np.abs(mean_s - mm) / max(sm, 1e-12)
-    z_std  = np.abs(std_s  - ms) / max(ss, 1e-12)
-    z_amp  = np.abs(amp_s  - ma) / max(sa, 1e-12)
+    z_mean = np.abs(meanv - mm) / max(sm, 1e-12)
+    z_std  = np.abs(stdv - ms)  / max(ss, 1e-12)
+    z_amp  = np.abs(ampv - ma)  / max(sa, 1e-12)
 
-    # Combined major-event flag (boolean per window)
-    major_flag = (corr_s < corr_thr) | (
+    # Combined major-event flag:
+    # - Either correlation massively drops, OR at least two of the feature z-scores exceed 6.
+    major_flag = (corr < corr_thr) | (
         ((z_mean > 6.0).astype(int) + (z_std > 6.0).astype(int) + (z_amp > 6.0).astype(int)) >= 2
     )
 
     # Require sustained violation ~50% of a period
     hold_windows = max(3, int(round(0.5 * spp / hop)))
     j0 = int(np.searchsorted(times, learn_end_time, side="right"))
+    run = 0
+    for j in range(j0, times.size):
+        if major_flag[j]:
+            run += 1
+            if run >= hold_windows:
+                return float(times[j - hold_windows + 1])
+        else:
+            run = 0
 
-    # Detector A: sustained correlation drop with interpolated crossing time
-    tA = _first_sustained_crossing_time(times, corr_s, threshold=corr_thr, below=True, hold_windows=hold_windows, start_idx=j0)
-
-    # Detector B: CUSUM on window mean (level shift), strict thresholds to avoid minute changes
-    tB = _cusum_first_time_interpolated(mean_s, times, mm, sm, k_sigma=0.5, h_sigma=8.0, start_idx=j0)
-
-    # Detector C: CUSUM on window amplitude (pulse height/width changes)
-    tC = _cusum_first_time_interpolated(amp_s, times, ma, sa, k_sigma=0.5, h_sigma=8.0, start_idx=j0)
-
-    # If none of the detectors fire, return NaN
-    candidates = [t for t in (tA, tB, tC) if np.isfinite(t)]
-    if not candidates:
-        return float("nan")
-
-    # Return earliest detected time
-    return float(min(candidates))
+    return float("nan")
 
 __all__ = ["pattern_major_fault_time"]
