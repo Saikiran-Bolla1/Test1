@@ -944,6 +944,3 @@ def pattern_shape_change_time(signal_view) -> float:
     return float(t_change)
 
 __all__ = ["pattern_shape_change_time"]
-    return float("nan")
-
-__all__ = ["pattern_major_fault_time"]
