@@ -238,14 +238,14 @@ def _refine_time_with_period_diff(
         return t_init
 
     T = spp * dt
-    # Search window centered near initial trigger to avoid far-away false hits
-    t_lo = max(learn_end_time, t_init - 1.2 * T)
-    t_hi = min(tu[-1], t_init + 1.0 * T)
+    # Narrow search window near initial trigger to avoid early bias
+    t_lo = max(learn_end_time, t_init - 0.25 * T)
+    t_hi = min(tu[-1], t_init + 1.25 * T)
     m = (td >= t_lo) & (td <= t_hi)
     if not np.any(m):
         return t_init
 
-    thr = md + 4.0 * sd  # strict threshold
+    thr = md + 4.0 * sd  # strict threshold above baseline
     hold = max(3, int(round(0.10 * spp)))  # sustained ~10% of a period
 
     run = 0
@@ -274,11 +274,10 @@ def pattern_change_time_robust(signal_view) -> float:
     Return the first timestamp (float seconds) where a MAJOR pattern change occurs.
     Minor variations are ignored by design. Returns float('nan') if none detected.
 
-    Latency control:
-    - Windows timestamped at START for responsiveness.
-    - Finer hop (~T/12).
-    - After first trigger, refine with a sample-level period-difference detector
-      to localize onset and eliminate start-of-window bias.
+    Enhancements:
+    - Finer hop (~T/12) + linear interpolation for correlation crossing.
+    - Sample-level refinement using |y[t]-y[t-T]| to localize onset.
+    - Keeps center-of-window timestamps to avoid early bias.
     """
     x, y = _as_numpy_xy(signal_view)
     if x.size < 256:
@@ -309,7 +308,7 @@ def pattern_change_time_robust(signal_view) -> float:
         return float("nan")
 
     # Sliding features across full record
-    hop = max(1, int(round(spp / 12)))  # ~12 hops per period
+    hop = max(1, int(round(spp / 12)))  # finer hop for time resolution
     times = []
     corr = []
     meanv = []
@@ -317,7 +316,7 @@ def pattern_change_time_robust(signal_view) -> float:
     ampv = []
     for i in range(0, N - spp, hop):
         c, m, s, a = _window_features(yu, i, spp, template)
-        times.append(tu[i])  # start-of-window
+        times.append(tu[i + spp // 2])  # center-of-window to avoid early bias
         corr.append(c)
         meanv.append(m)
         stdv.append(s)
@@ -345,7 +344,7 @@ def pattern_change_time_robust(signal_view) -> float:
 
     # Detector A: correlation drop (shape change), sustained
     corr_thr = min(mc - 4.5 * sc, 0.45)
-    hold_windows = max(3, int(round(0.3 * spp / hop)))  # ~30% of a period sustained
+    hold_windows = max(3, int(round(0.30 * spp / hop)))  # ~30% of a period sustained
 
     j0 = int(np.searchsorted(times, learn_end_time, side="right"))
     bad_corr = corr < corr_thr
@@ -358,7 +357,7 @@ def pattern_change_time_robust(signal_view) -> float:
             run += 1
             if run >= hold_windows:
                 jA_start = j - hold_windows + 1
-                # Interpolate across the last good and first bad window times
+                # Linear interpolation between last good and first bad centers
                 k = jA_start - 1
                 if k >= j0 and np.isfinite(corr[k]):
                     y1, t1 = corr[k], times[k]
@@ -387,17 +386,18 @@ def pattern_change_time_robust(signal_view) -> float:
         return float("nan")
     t0 = float(min(candidates))
 
-    # -------------------- Sample-level refinement (new) --------------------- #
-    # Build period-difference baseline on the learning region
+    # -------------------- Sample-level refinement --------------------------- #
     td_all, d_all = _period_diff_series(yu, tu, spp)
     if td_all.size > 0:
         learn_mask_d = td_all <= learn_end_time
-        md, sd = _robust_mean_std(d_all[learn_mask_d]) if np.any(learn_mask_d) else (float("nan"), float("nan"))
+        if np.any(learn_mask_d):
+            md, sd = _robust_mean_std(d_all[learn_mask_d])
+        else:
+            md, sd = (float("nan"), float("nan"))
+
         if np.isfinite(md) and np.isfinite(sd) and sd > 0:
             t_ref = _refine_time_with_period_diff(tu, yu, spp, learn_end_time, t0, md, sd, dt)
-            # Enforce that final time is not before end of learning region
-            t_final = max(t_ref, learn_end_time)
-            return float(t_final)
+            return float(max(t_ref, learn_end_time))
 
     # Fallback to coarse time if refinement not possible
     return float(max(t0, learn_end_time))
