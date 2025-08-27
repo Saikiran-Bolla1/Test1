@@ -1,30 +1,25 @@
 """
-Robust single-timestamp detector for when a repeating signal pattern changes.
+Signal change detectors.
 
-You pass ONLY:
-- signal_view: object with .x (timestamps) and .y (values), or a tuple (x, y)
+Includes:
+- burst_time: Detects the start/end timestamp of a burst of dense threshold crossings.
+- pattern_major_fault_time: Detects the first MAJOR disturbance time in a repeating pattern.
 
-Returns:
-- float timestamp (seconds) of the first MAJOR change, or float("nan") if none.
-
-Design goals:
-- Learn the nominal repeating pattern automatically from the first 30% (max half) of data.
-- Be tolerant to minute variations; trigger only on significant, sustained changes.
-- Combine multiple detectors:
-  1) Pattern correlation drop vs learned template (shape change)
-  2) CUSUM on mean and amplitude across windows (level/amplitude change)
-- Earliest time from the above that passes strict, sustained criteria is returned.
-
-No user-tunable parameters are exposed.
+No user-tunable parameters are exposed beyond the required function arguments.
 """
 
-from typing import Tuple
+from typing import Tuple, Literal
 import numpy as np
 
-# ------------------------------ Utilities ---------------------------------- #
+Edge = Literal["rising", "falling"]
+
+# ============================== Common utilities ==============================
 
 def _as_numpy_xy(signal_view) -> Tuple[np.ndarray, np.ndarray]:
-    # Accept (x, y) tuple or object with .x/.y
+    """
+    Return x, y as numpy arrays, drop NaNs in sync, and ensure time is strictly ascending.
+    If there are duplicate timestamps, they are stably sorted and kept as-is.
+    """
     if isinstance(signal_view, tuple) and len(signal_view) == 2:
         x = np.asarray(signal_view[0], dtype=float)
         y = np.asarray(signal_view[1], dtype=float)
@@ -42,13 +37,16 @@ def _as_numpy_xy(signal_view) -> Tuple[np.ndarray, np.ndarray]:
 
     # Ensure ascending time
     if x.size > 1 and not np.all(np.diff(x) >= 0):
-        idx = np.argsort(x)
+        idx = np.argsort(x, kind="stable")
         x, y = x[idx], y[idx]
 
     return x, y
 
 def _uniform_resample(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Resample to a uniform grid using linear interpolation. Returns (tu, yu, dt)."""
+    """
+    Resample to a uniform grid using linear interpolation.
+    Returns (tu, yu, dt). If dt is not finite or too small, returns (x, y, inf).
+    """
     if x.size < 8:
         return x, y, np.inf
     dt = float(np.median(np.diff(x)))
@@ -61,7 +59,9 @@ def _uniform_resample(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndar
     return tu, yu, dt
 
 def _robust_mean_std(a: np.ndarray) -> Tuple[float, float]:
-    """Median and robust sigma via MAD (scaled). Falls back to std if needed."""
+    """
+    Robust median and sigma via MAD (scaled). Falls back to std if needed.
+    """
     a = a[np.isfinite(a)]
     if a.size == 0:
         return float("nan"), float("nan")
@@ -73,7 +73,156 @@ def _robust_mean_std(a: np.ndarray) -> Tuple[float, float]:
         sigma = s if s > 0 else 1e-12
     return med, sigma
 
-# ---------------------------- Period estimation ----------------------------- #
+def _interp_cross_time(x0: float, x1: float, y0: float, y1: float, thr: float) -> float:
+    """Linear interpolation for threshold crossing at level thr between (x0,y0) and (x1,y1)."""
+    if y1 == y0:
+        return float(x0)
+    return float(x0 + (x1 - x0) * (thr - y0) / (y1 - y0))
+
+
+# ============================== Burst detector ===============================
+
+def _schmitt_edges(signal_view, threshold: float, atol: float, edge: Edge) -> np.ndarray:
+    """
+    Schmitt-trigger style edge extractor with hysteresis band [thr-atol, thr+atol].
+    - For 'rising', records times when the state flips from BELOW to ABOVE.
+    - For 'falling', records times when the state flips from ABOVE to BELOW.
+    Uses linear interpolation to timestamp the crossing at 'threshold'.
+    """
+    x, y = _as_numpy_xy(signal_view)
+    n = x.size
+    if n < 2:
+        return np.array([], dtype=float)
+
+    thr = float(threshold)
+    up = thr + float(atol)
+    dn = thr - float(atol)
+
+    # Initial state
+    above = y[0] > up
+    below = y[0] < dn
+    state = 1 if above else (0 if below else None)
+
+    times = []
+    for i in range(n - 1):
+        y0, y1 = float(y[i]), float(y[i + 1])
+        x0, x1 = float(x[i]), float(x[i + 1])
+
+        # Update state only after crossing the opposite bound
+        if state is None:
+            # Inside deadband: decide if we left it
+            if y1 >= up:
+                state = 1
+                if edge == "rising":
+                    times.append(_interp_cross_time(x0, x1, y0, y1, thr))
+            elif y1 <= dn:
+                state = 0
+                if edge == "falling":
+                    times.append(_interp_cross_time(x0, x1, y0, y1, thr))
+            continue
+
+        if state == 0:
+            # Currently below; look for rising transition only if y crosses 'up'
+            if y0 <= dn and y1 >= up:
+                state = 1
+                if edge == "rising":
+                    times.append(_interp_cross_time(x0, x1, y0, y1, thr))
+            elif y0 <= dn and dn < y1 < up:
+                # Enter deadband upward: wait until leaving at 'up'
+                if y1 >= up:
+                    state = 1
+                    if edge == "rising":
+                        times.append(_interp_cross_time(x0, x1, y0, y1, thr))
+        else:
+            # state == 1: currently above; look for falling transition only if y crosses 'dn'
+            if y0 >= up and y1 <= dn:
+                state = 0
+                if edge == "falling":
+                    times.append(_interp_cross_time(x0, x1, y0, y1, thr))
+            elif y0 >= up and dn < y1 < up:
+                # Enter deadband downward: wait until leaving at 'dn'
+                if y1 <= dn:
+                    state = 0
+                    if edge == "falling":
+                        times.append(_interp_cross_time(x0, x1, y0, y1, thr))
+
+    if not times:
+        return np.array([], dtype=float)
+    return np.array(times, dtype=float)
+
+def _dense_runs_from_edges(edges: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Identify dense toggling runs from edge times using an adaptive gap threshold.
+    Returns (run_starts, run_ends, gap_threshold) where starts/ends are indices into gaps.
+    A run of gaps[i0..i1] corresponds to edges[i0]..edges[i1+1].
+    """
+    if edges.size < 4:
+        return np.array([], dtype=int), np.array([], dtype=int), float("nan")
+
+    gaps = np.diff(edges)
+    if gaps.size == 0:
+        return np.array([], dtype=int), np.array([], dtype=int), float("nan")
+
+    med_all = float(np.median(gaps))
+    p25_all = float(np.percentile(gaps, 25))
+    # Use early portion as baseline if available
+    k_learn = max(5, int(0.3 * gaps.size))
+    med_base = float(np.median(gaps[:k_learn])) if gaps.size >= k_learn else med_all
+
+    # Adaptive threshold favors dense (short) gaps; conservative relative to baseline
+    thr = max(1e-12, min(0.6 * med_all, 1.2 * p25_all, 0.8 * med_base))
+
+    small = gaps <= thr
+    if not np.any(small):
+        return np.array([], dtype=int), np.array([], dtype=int), thr
+
+    # Find contiguous True segments in 'small'
+    b = small.astype(np.int8)
+    db = np.diff(b)
+    # Starts are where we go 0->1; also include if first is True
+    starts = np.flatnonzero(np.concatenate(([b[0] == 1], db == 1)))
+    # Ends are where we go 1->0; also include if last is True
+    ends = np.flatnonzero(np.concatenate((db == -1, [b[-1] == 1])))
+
+    # Keep only runs with at least 3 small gaps (>= 4 edges in the run)
+    valid = (ends - starts + 1) >= 3
+    return starts[valid], ends[valid], thr
+
+def burst_time(
+    signal_view,
+    value: float,
+    atol: float,
+    edge: Edge,
+    burst: bool = True,  # kept for signature clarity; always treated as burst detection
+) -> float:
+    """
+    Single-timestamp burst detector.
+
+    - edge='rising'  -> returns the burst START time (first edge of dense run)
+    - edge='falling' -> returns the burst END time   (last edge of dense run)
+
+    Returns float('nan') if not detected.
+    """
+    edges = _schmitt_edges(signal_view, value, atol, edge)
+    if edges.size < 4:
+        return float("nan")
+
+    run_starts, run_ends, _thr = _dense_runs_from_edges(edges)
+    if run_starts.size == 0:
+        return float("nan")
+
+    if edge == "rising":
+        # Choose earliest dense run (start of burst)
+        i0 = int(run_starts[0])
+        return float(edges[i0])
+    else:
+        # Choose latest dense run (end of burst)
+        i1 = int(run_ends[-1]) + 1  # convert gap-index to edge index
+        i1 = min(i1, edges.size - 1)
+        return float(edges[i1])
+
+
+# ===================== Major repeating pattern change detector =====================
 
 def _estimate_period_fft(y: np.ndarray, dt: float) -> float:
     """Estimate dominant period via FFT of zero-mean data; NaN if not reliable."""
@@ -89,14 +238,12 @@ def _estimate_period_fft(y: np.ndarray, dt: float) -> float:
         return np.nan
     mag = np.abs(Z)
     mag[0] = 0.0  # ignore DC
-    # at least ~3 cycles in window and <= 90% Nyquist
-    fmin = 3.0 / (N * dt)
-    fmax = 0.45 / dt
+    fmin = 3.0 / (N * dt)   # at least ~3 cycles in learn window
+    fmax = 0.45 / dt        # <= 90% Nyquist
     band = (f >= fmin) & (f <= fmax)
     if not np.any(band):
         return np.nan
-    k = np.argmax(mag[band])
-    idx = np.flatnonzero(band)[k]
+    idx = np.flatnonzero(band)[np.argmax(mag[band])]
     f0 = float(f[idx])
     return np.nan if f0 <= 0 else (1.0 / f0)
 
@@ -127,8 +274,6 @@ def _best_period(y: np.ndarray, dt: float) -> float:
         return T_fft
     return _estimate_period_acf(y, dt)
 
-# --------------------------- Template construction -------------------------- #
-
 def _align_and_average(y: np.ndarray, spp: int, max_periods: int = 12, template_points: int = 128) -> np.ndarray:
     """
     Build a normalized template by aligning up to max_periods cycles (length spp),
@@ -156,22 +301,18 @@ def _align_and_average(y: np.ndarray, spp: int, max_periods: int = 12, template_
         std = float(np.std(seg))
         if std > 0:
             seg = seg / std
-        # align by circular shift maximizing correlation
         c = np.fft.ifft(np.fft.fft(ref) * np.conj(np.fft.fft(seg))).real
         shift = int(np.argmax(c)) % spp
-        seg_aligned = np.roll(seg, shift)
-        acc += seg_aligned
+        acc += np.roll(seg, shift)
         cnt += 1
 
     if cnt == 0:
         return np.array([], dtype=float)
 
     avg = acc / cnt
-    # resample to a fixed phase grid for stable comparison
     xi = np.linspace(0, 1, spp, endpoint=False)
     phase_grid = np.linspace(0, 1, template_points, endpoint=False)
     tpl = np.interp(phase_grid, xi, avg)
-    # unit norm
     norm = float(np.linalg.norm(tpl))
     if norm > 0:
         tpl = tpl / norm
@@ -201,45 +342,21 @@ def _window_features(y: np.ndarray, i: int, spp: int, template: np.ndarray) -> T
     c = float(np.dot(seg_t, template) / denom) if denom > 0 else 0.0
     return c, m, s, a
 
-# ------------------------------- CUSUM -------------------------------------- #
-
-def _cusum_first_time(series: np.ndarray, times: np.ndarray, baseline: float, sigma: float, k_sigma: float, h_sigma: float, start_idx: int) -> float:
-    """
-    One-sided two-direction CUSUM on a windowed feature series.
-    Returns first time where either pos or neg CUSUM crosses h_sigma*sigma, else NaN.
-    """
-    if not np.isfinite(sigma) or sigma == 0:
-        return float("nan")
-    k = k_sigma * sigma
-    h = h_sigma * sigma
-
-    s_pos = 0.0
-    s_neg = 0.0
-    for j in range(start_idx, series.size):
-        x = float(series[j]) - baseline
-        s_pos = max(0.0, s_pos + (x - k))
-        s_neg = min(0.0, s_neg + (x + k))
-        if s_pos > h or abs(s_neg) > h:
-            return float(times[j])
-    return float("nan")
-
-# -------------------------- Sample-level refinement ------------------------- #
-
 def _period_diff_series(yu: np.ndarray, tu: np.ndarray, spp: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute |y[t] - y[t - spp]| and its timestamps."""
+    """
+    Sample-level period-difference detector: d[t] = |y[t] - y[t - spp]|.
+    Returns (td, d); td aligns with yu[spp:].
+    """
     if spp < 2 or yu.size <= spp:
         return np.array([], dtype=float), np.array([], dtype=float)
     d = np.abs(yu[spp:] - yu[:-spp])
     td = tu[spp:]
-    # small median filter to reduce spikiness
+    # light median smoothing (k=5) to reduce spikiness
     if d.size >= 5:
         k = 5
         pad = k // 2
-        d_pad = np.pad(d, (pad, pad), mode="edge")
-        d_smooth = np.median(
-            np.stack([d_pad[i:i + d.size] for i in range(k)], axis=0), axis=0
-        )
-        d = d_smooth
+        dp = np.pad(d, (pad, pad), mode="edge")
+        d = np.median(np.stack([dp[i:i + d.size] for i in range(k)], axis=0), axis=0)
     return td, d
 
 def _refine_time_with_period_diff(
@@ -250,9 +367,12 @@ def _refine_time_with_period_diff(
     t_init: float,
     md: float,
     sd: float,
-    dt: float
+    dt: float,
 ) -> float:
-    """Refine onset time around t_init using sample-level period-difference detector."""
+    """
+    Refine coarse trigger time using the first sustained crossing on d[t] near t_init.
+    Returns NaN if refinement cannot confirm a nearby onset.
+    """
     td, d = _period_diff_series(yu, tu, spp)
     if td.size == 0 or not np.isfinite(sd) or sd == 0:
         return float("nan")
@@ -264,7 +384,7 @@ def _refine_time_with_period_diff(
     if not np.any(m):
         return float("nan")
 
-    thr = md + 4.0 * sd
+    thr = md + 4.0 * sd  # strict above-baseline threshold
     hold = max(3, int(round(0.10 * spp)))  # ~10% of a period
 
     run = 0
@@ -280,27 +400,35 @@ def _refine_time_with_period_diff(
             run = 0
     return float("nan")
 
-# ------------------------------ Main detector ------------------------------- #
-
-def pattern_change_time_robust(signal_view) -> float:
+def pattern_major_fault_time(signal_view) -> float:
     """
-    Return the first timestamp (float seconds) where a MAJOR pattern change occurs.
-    Minor variations are ignored by design. Returns float('nan') if none detected.
+    Return the first timestamp (float seconds) where a MAJOR disturbance occurs.
+    Minor changes are ignored by design. Returns float('nan') if none detected.
+
+    Strategy:
+    - Learn template from first 30% (max half).
+    - Slide a window of one period with hop ~T/12; use center-of-window timestamps.
+    - Detect:
+      A) Large correlation drop (c < min(mc - 4σ, 0.55)), sustained ~35% of a period,
+         then refine onset with sample-level period-diff and require confirmation.
+      B) CUSUM-like via sigma test on mean/std/amp: require at least two z-scores > 6,
+         sustained ~35% of a period.
+    - Return the earliest confirmed time, clamped to not earlier than learn_end_time.
     """
     x, y = _as_numpy_xy(signal_view)
     if x.size < 256:
         return float("nan")
 
-    # Uniform resample
     tu, yu, dt = _uniform_resample(x, y)
     if not np.isfinite(dt) or tu.size < 256:
         return float("nan")
 
-    # Learn baseline window
+    # Learn region
     learn_fraction = 0.30
     N = tu.size
     N_learn = min(max(256, int(N * learn_fraction)), max(256, N // 2))
     yL = yu[:N_learn]
+    learn_end_time = tu[min(N_learn - 1, N - 1)]
 
     # Period estimate
     T = _best_period(yL, dt)
@@ -310,13 +438,13 @@ def pattern_change_time_robust(signal_view) -> float:
     if spp < 12 or spp > N_learn // 2:
         return float("nan")
 
-    # Template from learning region
+    # Template
     template = _align_and_average(yL, spp, max_periods=12, template_points=128)
     if template.size == 0:
         return float("nan")
 
-    # Sliding features across full record
-    hop = max(1, int(round(spp / 12)))  # finer hop for time resolution
+    # Sliding features
+    hop = max(1, int(round(spp / 12)))  # ~12 hops per period for better time resolution
     times = []
     corr = []
     meanv = []
@@ -329,6 +457,7 @@ def pattern_change_time_robust(signal_view) -> float:
         meanv.append(m)
         stdv.append(s)
         ampv.append(a)
+
     times = np.asarray(times, dtype=float)
     corr = np.asarray(corr, dtype=float)
     meanv = np.asarray(meanv, dtype=float)
@@ -337,8 +466,6 @@ def pattern_change_time_robust(signal_view) -> float:
     if times.size == 0:
         return float("nan")
 
-    # Baseline stats (learn region)
-    learn_end_time = tu[min(N_learn - 1, N - 1)]
     learn_mask = times <= learn_end_time
     if not np.any(learn_mask):
         return float("nan")
@@ -350,68 +477,79 @@ def pattern_change_time_robust(signal_view) -> float:
     if not all(np.isfinite(v) for v in (mc, sc, mm, sm, ms, ss, ma, sa)):
         return float("nan")
 
-    # Detector A: correlation drop (shape change), with gating by period-diff confirmation
-    corr_enabled = np.isfinite(mc) and np.isfinite(sc) and mc >= 0.70  # skip A if baseline corr is weak
-    tA = float("nan")
+    # Detector A: correlation drop (shape change), sustained, with interpolation and refinement
+    c_thr = min(mc - 4.0 * sc, 0.55)  # conservative absolute cap
+    hold_windows = max(3, int(round(0.35 * spp / hop)))  # ~35% of a period sustained
     j0 = int(np.searchsorted(times, learn_end_time, side="right"))
-    if corr_enabled:
-        corr_thr = min(mc - 3.5 * sc, 0.70)  # responsive but conservative
-        hold_windows = max(3, int(round(0.30 * spp / hop)))  # ~30% period sustained
-        bad_corr = corr < corr_thr
+    bad = corr < c_thr
 
-        # Prepare period-diff baseline for confirmation
-        td_all, d_all = _period_diff_series(yu, tu, spp)
-        md = sd = float("nan")
-        if td_all.size > 0:
-            m_d_learn = td_all <= learn_end_time
-            if np.any(m_d_learn):
-                md, sd = _robust_mean_std(d_all[m_d_learn])
+    # Precompute period-diff baseline for refinement
+    td_all, d_all = _period_diff_series(yu, tu, spp)
+    md = sd = float("nan")
+    if td_all.size > 0:
+        m_d_learn = td_all <= learn_end_time
+        if np.any(m_d_learn):
+            md, sd = _robust_mean_std(d_all[m_d_learn])
 
-        j = j0
-        run = 0
-        while j < times.size:
-            if bad_corr[j]:
-                run += 1
-                if run >= hold_windows:
-                    jA_start = j - hold_windows + 1
-                    # Interpolate crossing time
-                    k = jA_start - 1
-                    if k >= j0 and np.isfinite(corr[k]):
-                        y1, t1 = corr[k], times[k]
-                        y2, t2 = corr[jA_start], times[jA_start]
-                        if y2 != y1:
-                            alpha = (corr_thr - y1) / (y2 - y1)
-                            alpha = float(np.clip(alpha, 0.0, 1.0))
-                            t_cross = t1 + alpha * (t2 - t1)
-                        else:
-                            t_cross = times[jA_start]
+    tA = float("nan")
+    run = 0
+    for j in range(j0, times.size):
+        if bad[j]:
+            run += 1
+            if run >= hold_windows:
+                j_start = j - hold_windows + 1
+                k = j_start - 1
+                # Linear interpolate the threshold crossing between last good and first bad
+                if k >= j0 and np.isfinite(corr[k]):
+                    y1, t1 = corr[k], times[k]
+                    y2, t2 = corr[j_start], times[j_start]
+                    if y2 != y1:
+                        alpha = (c_thr - y1) / (y2 - y1)
+                        alpha = float(np.clip(alpha, 0.0, 1.0))
+                        t_cross = t1 + alpha * (t2 - t1)
                     else:
-                        t_cross = times[jA_start]
+                        t_cross = times[j_start]
+                else:
+                    t_cross = times[j_start]
 
-                    # Confirm with period-diff; if cannot confirm, continue scanning
-                    t_ref = float("nan")
-                    if np.isfinite(md) and np.isfinite(sd) and sd > 0:
-                        t_ref = _refine_time_with_period_diff(tu, yu, spp, learn_end_time, t_cross, md, sd, dt)
-                    if np.isfinite(t_ref):
-                        tA = t_ref
-                        break
-                    else:
-                        # discard this correlation run as spurious and continue
-                        run = 0
-            else:
-                run = 0
-            j += 1
+                # Confirm and refine with period-diff
+                t_ref = float("nan")
+                if np.isfinite(md) and np.isfinite(sd) and sd > 0:
+                    t_ref = _refine_time_with_period_diff(tu, yu, spp, learn_end_time, t_cross, md, sd, dt)
+                if np.isfinite(t_ref):
+                    tA = t_ref
+                    break
+                else:
+                    # If not confirmed, continue scanning
+                    run = 0
+        else:
+            run = 0
 
-    # Detector B: CUSUM on window mean (level shift)
-    tB = _cusum_first_time(meanv, times, mm, sm, k_sigma=0.5, h_sigma=7.0, start_idx=j0)
+    # Detector B: feature sigma test (mean/std/amp), sustained
+    z_mean = np.abs(meanv - mm) / max(sm, 1e-12)
+    z_std  = np.abs(stdv - ms)  / max(ss, 1e-12)
+    z_amp  = np.abs(ampv - ma)  / max(sa, 1e-12)
+    major_feat = ((z_mean > 6.0).astype(int) + (z_std > 6.0).astype(int) + (z_amp > 6.0).astype(int)) >= 2
 
-    # Detector C: CUSUM on window amplitude (pulse height/width changes)
-    tC = _cusum_first_time(ampv, times, ma, sa, k_sigma=0.5, h_sigma=7.0, start_idx=j0)
+    tB = float("nan")
+    run = 0
+    for j in range(j0, times.size):
+        if major_feat[j]:
+            run += 1
+            if run >= hold_windows:
+                tB = float(times[j - hold_windows + 1])
+                break
+        else:
+            run = 0
 
-    # Choose earliest valid time
-    candidates = [t for t in (tA, tB, tC) if np.isfinite(t)]
+    # Final selection (earliest confirmed)
+    candidates = [t for t in (tA, tB) if np.isfinite(t)]
     if not candidates:
         return float("nan")
     return float(max(min(candidates), learn_end_time))
 
-__all__ = ["pattern_change_time_robust"]
+
+__all__ = [
+    "burst_time",
+    "pattern_major_fault_time",
+]
