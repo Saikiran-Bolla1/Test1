@@ -1,52 +1,34 @@
-"""
-Robust shape-only fault time detector with diagnostics and a no-NaN fallback.
-
-What you get:
-- pattern_major_fault_time(signal_view) -> float
-  Robust detector (may return NaN if signal is ambiguous).
-
-- pattern_major_fault_time_always(signal_view) -> float
-  Never returns NaN. If strict detectors fail, it returns the best-guess time
-  (largest post-baseline correlation drop point).
-
-- pattern_major_fault_time_debug(signal_view) -> (float, dict)
-  Same as pattern_major_fault_time but also returns a debug dict explaining
-  which step failed or which fallback was used and all key stats.
-
-All methods are shape-only and phase-invariant:
-- Each analysis window is z-normalized (offset/scale removed).
-- Circular correlation makes it robust to small timing jitter.
-
-Tips:
-- If you are seeing NaN, call pattern_major_fault_time_debug(...) and inspect 'reason'.
-- If you just need a timestamp no matter what, use pattern_major_fault_time_always(...).
-"""
-
-from typing import Tuple, List, Dict, Any
+from typing import Tuple
 import numpy as np
 
 # ------------------------------ Utilities ---------------------------------- #
 
 def _as_numpy_xy(signal_view) -> Tuple[np.ndarray, np.ndarray]:
+    # Accept (x, y) tuple or object with .x/.y
     if isinstance(signal_view, tuple) and len(signal_view) == 2:
         x = np.asarray(signal_view[0], dtype=float)
         y = np.asarray(signal_view[1], dtype=float)
     else:
         x = np.asarray(getattr(signal_view, "x"), dtype=float)
         y = np.asarray(getattr(signal_view, "y"), dtype=float)
+
     if x.ndim != 1 or y.ndim != 1 or x.size != y.size:
         raise ValueError("signal_view.x and signal_view.y must be 1D arrays of the same length.")
+
     # Drop NaNs (synchronized)
     if np.isnan(x).any() or np.isnan(y).any():
         m = (~np.isnan(x)) & (~np.isnan(y))
         x, y = x[m], y[m]
+
     # Ensure ascending time
     if x.size > 1 and not np.all(np.diff(x) >= 0):
         idx = np.argsort(x)
         x, y = x[idx], y[idx]
+
     return x, y
 
 def _uniform_resample(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Resample to a uniform grid using linear interpolation. Returns (tu, yu, dt)."""
     if x.size < 8:
         return x, y, np.inf
     dt = float(np.median(np.diff(x)))
@@ -58,19 +40,8 @@ def _uniform_resample(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndar
     yu = np.interp(tu, x, y)
     return tu, yu, dt
 
-def _median_filter(v: np.ndarray, k: int = 5) -> np.ndarray:
-    if k <= 1 or v.size == 0:
-        return v.copy()
-    if k % 2 == 0:
-        k += 1
-    r = k // 2
-    pad = np.pad(v, (r, r), mode="reflect")
-    out = np.empty_like(v)
-    for i in range(v.size):
-        out[i] = np.median(pad[i:i+k])
-    return out
-
 def _robust_mean_std(a: np.ndarray) -> Tuple[float, float]:
+    """Median and robust sigma via MAD (scaled). Falls back to std if needed."""
     a = a[np.isfinite(a)]
     if a.size == 0:
         return float("nan"), float("nan")
@@ -85,6 +56,7 @@ def _robust_mean_std(a: np.ndarray) -> Tuple[float, float]:
 # ---------------------------- Period estimation ----------------------------- #
 
 def _estimate_period_fft(y: np.ndarray, dt: float) -> float:
+    """Estimate dominant period via FFT of zero-mean data; NaN if not reliable."""
     N = y.size
     if N < 64 or not np.isfinite(dt) or dt <= 0:
         return np.nan
@@ -96,18 +68,20 @@ def _estimate_period_fft(y: np.ndarray, dt: float) -> float:
     if f.size <= 1:
         return np.nan
     mag = np.abs(Z)
-    mag[0] = 0.0
+    mag[0] = 0.0  # ignore DC
+    # at least ~3 cycles in window and <= 90% Nyquist
     fmin = 3.0 / (N * dt)
     fmax = 0.45 / dt
     band = (f >= fmin) & (f <= fmax)
     if not np.any(band):
         return np.nan
-    k = int(np.argmax(mag[band]))
+    k = np.argmax(mag[band])
     idx = np.flatnonzero(band)[k]
     f0 = float(f[idx])
     return np.nan if f0 <= 0 else (1.0 / f0)
 
 def _estimate_period_acf(y: np.ndarray, dt: float) -> float:
+    """Estimate dominant period via autocorrelation peak; NaN if not reliable."""
     N = y.size
     if N < 128 or not np.isfinite(dt) or dt <= 0:
         return np.nan
@@ -133,337 +107,224 @@ def _best_period(y: np.ndarray, dt: float) -> float:
         return T_fft
     return _estimate_period_acf(y, dt)
 
-# --------------------------- Shape-only template ---------------------------- #
+# --------------------------- Template construction -------------------------- #
 
-def _resample_unit(seg: np.ndarray, L: int) -> np.ndarray:
-    xi = np.linspace(0, 1, seg.size, endpoint=False)
-    z = seg - np.mean(seg)
-    s = float(np.std(seg))
-    if s > 0:
-        z = z / s
-    else:
-        z = z * 0.0
-    return np.interp(np.linspace(0, 1, L, endpoint=False), xi, z)
-
-def _phase_invariant_corr(a: np.ndarray, b: np.ndarray) -> float:
-    na = float(np.linalg.norm(a)); nb = float(np.linalg.norm(b))
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    a = a / na; b = b / nb
-    c = np.fft.ifft(np.fft.fft(a) * np.conj(np.fft.fft(b))).real
-    return float(np.clip(np.max(c), -1.0, 1.0))
-
-def _template_from_learning(yu: np.ndarray, spp: int, L: int, learn_samples: int) -> np.ndarray:
-    hop = max(1, spp // 8)
-    windows = []
-    for i in range(0, learn_samples - spp, hop):
-        windows.append(_resample_unit(yu[i:i+spp], L))
-    if len(windows) < 6:
+def _align_and_average(y: np.ndarray, spp: int, max_periods: int = 12, template_points: int = 128) -> np.ndarray:
+    """
+    Build a normalized template by aligning up to max_periods cycles (length spp),
+    using circular shift to maximize correlation with the first cycle.
+    """
+    n = y.size
+    spp = int(max(8, spp))
+    K = min(max_periods, n // spp)
+    if K < 2:
         return np.array([], dtype=float)
-    W = np.stack(windows, axis=0)
-    tpl = np.mean(W, axis=0)
-    n = float(np.linalg.norm(tpl))
-    if n > 0:
-        tpl = tpl / n
-    scores = np.array([_phase_invariant_corr(w, tpl) for w in W], dtype=float)
-    order = np.argsort(-scores)
-    K = min(16, max(8, len(order)//2))
-    top = W[order[:K]]
-    tpl = np.mean(top, axis=0)
-    n = float(np.linalg.norm(tpl))
-    if n > 0:
-        tpl = tpl / n
+
+    ref = y[0:spp].astype(float)
+    ref = ref - np.mean(ref)
+    s = float(np.std(ref))
+    if s > 0:
+        ref /= s
+
+    acc = np.zeros(spp, dtype=float)
+    cnt = 0
+    for i in range(K):
+        seg = y[i * spp:(i + 1) * spp].astype(float)
+        if seg.size != spp:
+            break
+        seg = seg - np.mean(seg)
+        std = float(np.std(seg))
+        if std > 0:
+            seg = seg / std
+        # align by circular shift maximizing correlation
+        c = np.fft.ifft(np.fft.fft(ref) * np.conj(np.fft.fft(seg))).real
+        shift = int(np.argmax(c)) % spp
+        seg_aligned = np.roll(seg, shift)
+        acc += seg_aligned
+        cnt += 1
+
+    if cnt == 0:
+        return np.array([], dtype=float)
+
+    avg = acc / cnt
+    # resample to a fixed phase grid for stable comparison
+    xi = np.linspace(0, 1, spp, endpoint=False)
+    phase_grid = np.linspace(0, 1, template_points, endpoint=False)
+    tpl = np.interp(phase_grid, xi, avg)
+    # unit norm
+    norm = float(np.linalg.norm(tpl))
+    if norm > 0:
+        tpl = tpl / norm
     return tpl
 
-# ------------------------------- Detection ---------------------------------- #
+def _window_features(y: np.ndarray, i: int, spp: int, template: np.ndarray) -> Tuple[float, float, float, float]:
+    """
+    Features for window y[i:i+spp]:
+    - correlation to template (normalized)
+    - mean
+    - std
+    - peak-to-peak amplitude
+    """
+    seg = y[i:i + spp]
+    if seg.size != spp:
+        return np.nan, np.nan, np.nan, np.nan
+    m = float(np.mean(seg))
+    s = float(np.std(seg))
+    a = float(np.max(seg) - np.min(seg))
+    # normalized correlation
+    z = seg - m
+    if s > 0:
+        z = z / s
+    xi = np.linspace(0, 1, seg.size, endpoint=False)
+    seg_t = np.interp(np.linspace(0, 1, template.size, endpoint=False), xi, z)
+    denom = float(np.linalg.norm(seg_t))
+    c = float(np.dot(seg_t, template) / denom) if denom > 0 else 0.0
+    return c, m, s, a
 
-def _correlation_series(tu: np.ndarray, yu: np.ndarray, spp: int, L: int, template: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
-    hop = max(1, spp // 8)  # ~8 hops per period
+# ------------------------------- CUSUM -------------------------------------- #
+
+def _cusum_first_time(series: np.ndarray, times: np.ndarray, baseline: float, sigma: float, k_sigma: float, h_sigma: float, start_idx: int) -> float:
+    """
+    One-sided two-direction CUSUM on a windowed feature series.
+    Returns first time where either pos or neg CUSUM crosses h_sigma*sigma, else NaN.
+    """
+    if not np.isfinite(sigma) or sigma == 0:
+        return float("nan")
+    k = k_sigma * sigma
+    h = h_sigma * sigma
+
+    s_pos = 0.0
+    s_neg = 0.0
+    for j in range(start_idx, series.size):
+        x = float(series[j]) - baseline
+        s_pos = max(0.0, s_pos + (x - k))
+        s_neg = min(0.0, s_neg + (x + k))
+        if s_pos > h or abs(s_neg) > h:
+            return float(times[j])
+    return float("nan")
+
+# ------------------------------ Main detector ------------------------------- #
+
+def pattern_change_time_robust(signal_view) -> float:
+    """
+    Return the first timestamp (float seconds) where a MAJOR pattern change occurs.
+    Minor variations are ignored by design. Returns float('nan') if none detected.
+
+    Latency minimizations vs previous version:
+    - Window timestamps are at the START of the window (not center).
+    - Finer hop (~T/12) to reduce time quantization.
+    - Linear interpolation at the first correlation threshold crossing.
+    """
+    x, y = _as_numpy_xy(signal_view)
+    if x.size < 256:
+        return float("nan")
+
+    # Uniform resample
+    tu, yu, dt = _uniform_resample(x, y)
+    if not np.isfinite(dt) or tu.size < 256:
+        return float("nan")
+
+    # Learn baseline window
+    learn_fraction = 0.30
+    N = tu.size
+    N_learn = min(max(256, int(N * learn_fraction)), max(256, N // 2))
+    yL = yu[:N_learn]
+
+    # Period estimate
+    T = _best_period(yL, dt)
+    if not np.isfinite(T):
+        return float("nan")
+    spp = int(round(T / dt))
+    if spp < 12 or spp > N_learn // 2:
+        return float("nan")
+
+    # Template from learning region
+    template = _align_and_average(yL, spp, max_periods=12, template_points=128)
+    if template.size == 0:
+        return float("nan")
+
+    # Sliding features across full record
+    # Finer hop for earlier detection while keeping compute reasonable
+    hop = max(1, int(round(spp / 12)))  # ~12 hops per period (was ~8)
     times = []
     corr = []
-    N = yu.size
+    meanv = []
+    stdv = []
+    ampv = []
     for i in range(0, N - spp, hop):
-        seg = yu[i:i+spp]
-        z = _resample_unit(seg, L)
-        c = _phase_invariant_corr(z, template)
-        times.append(tu[i + spp // 2])
+        c, m, s, a = _window_features(yu, i, spp, template)
+        # Timestamp at START of window to avoid ~T/2 latency
+        times.append(tu[i])
         corr.append(c)
-    return np.asarray(times, dtype=float), np.asarray(corr, dtype=float), hop
-
-def _first_sustained_drop_time(times: np.ndarray,
-                               corr_s: np.ndarray,
-                               learn_end_time: float,
-                               mc: float, sc: float,
-                               spp: int, hop: int,
-                               info: Dict[str, Any]) -> float:
-    # Strict thresholds
-    low_thr = min(mc - 5.0 * sc, 0.40)
-    pre_high_thr = max(0.75, mc - 1.0 * sc)
-    hold_low = max(4, int(round(1.0 * spp / hop)))  # ~1 period low
-    pre_need = max(3, int(round(1.0 * spp / hop)))  # ~1 period high before
-
-    info.update(dict(threshold=low_thr, pre_high_thr=pre_high_thr,
-                     hold_low=hold_low, pre_need=pre_need))
-
-    j0 = int(np.searchsorted(times, learn_end_time, side="right"))
-    if j0 >= times.size:
-        info["reason"] = "no_post_baseline_windows"
-        return float("nan")
-
-    below = corr_s < low_thr
-    run = 0
-    for j in range(j0, times.size):
-        if below[j]:
-            run += 1
-        else:
-            run = 0
-        if run >= hold_low:
-            s = j - run + 1
-            p0 = max(j0, s - pre_need)
-            if p0 < s and np.all(corr_s[p0:s] > pre_high_thr):
-                # Interpolate crossing between last high and first low
-                k = s - 1
-                while k >= j0 and below[k]:
-                    k -= 1
-                if k < j0:
-                    info["reason"] = "sustained_low_no_interpolation"
-                    return float(times[s])
-                y0, y1 = float(corr_s[k]), float(corr_s[k+1])
-                t0, t1 = float(times[k]), float(times[k+1])
-                if t1 != t0 and y1 != y0:
-                    alpha = (low_thr - y0) / (y1 - y0)
-                    alpha = float(np.clip(alpha, 0.0, 1.0))
-                    info["reason"] = "sustained_low_interpolated"
-                    return float(t0 + alpha * (t1 - t0))
-                info["reason"] = "sustained_low_no_slope"
-                return float(times[s])
-
-    info["reason"] = "no_sustained_low_found"
-    return float("nan")
-
-# ---------------------------- Windowed fallback ----------------------------- #
-
-def _window_shape_change_time(tu: np.ndarray, yu: np.ndarray, learn_end_time: float, info: Dict[str, Any], always_return: bool) -> float:
-    N = tu.size
-    if N < 64:
-        info["fallback_reason"] = "too_short_for_window"
-        return float("nan")
-
-    # Window ~ 5% of record (clipped), hop quarter window
-    W = int(np.clip(N // 20, 48, N // 6))
-    hop = max(1, W // 4)
-    L = 128
-
-    windows = []
-    win_times = []
-    for i in range(0, N - W, hop):
-        seg = yu[i:i+W]
-        z = _resample_unit(seg, L)
-        windows.append(z)
-        win_times.append(tu[i + W // 2])
-    if len(windows) < 6:
-        info["fallback_reason"] = "too_few_windows"
-        if always_return and len(win_times) > 0:
-            return float(win_times[-1])
-        return float("nan")
-
-    windows = np.asarray(windows, dtype=float)
-    times = np.asarray(win_times, dtype=float)
-    base_mask = times <= learn_end_time
-    if not np.any(base_mask):
-        info["fallback_reason"] = "no_baseline_windows"
-        return float("nan")
-
-    tpl = np.mean(windows[base_mask], axis=0)
-    n = float(np.linalg.norm(tpl))
-    if n == 0:
-        info["fallback_reason"] = "zero_norm_baseline_template"
-        return float("nan")
-    tpl = tpl / n
-
-    corr = np.array([_phase_invariant_corr(w, tpl) for w in windows], dtype=float)
-    corr_s = _median_filter(corr, k=5)
-    mc, sc = _robust_mean_std(corr_s[base_mask])
-    if not np.isfinite(mc) or not np.isfinite(sc):
-        info["fallback_reason"] = "bad_baseline_stats"
-        return float("nan")
-    thr = min(mc - 4.0 * sc, 0.50)
-
-    hold_windows = max(2, int(round(0.30 * (W / hop))))
-    j0 = int(np.searchsorted(times, learn_end_time, side="right"))
-    below = corr_s < thr
-    run = 0
-    for j in range(j0, times.size):
-        if below[j]:
-            run += 1
-        else:
-            run = 0
-        if run >= hold_windows:
-            s = j - run + 1
-            # interpolate crossing between last high and first low
-            k = s - 1
-            while k >= j0 and below[k]:
-                k -= 1
-            if k < j0:
-                info["fallback_reason"] = "window_sustained_no_interpolation"
-                return float(times[s])
-            y0, y1 = float(corr_s[k]), float(corr_s[k+1])
-            t0, t1 = float(times[k]), float(times[k+1])
-            if t1 != t0 and y1 != y0:
-                alpha = (thr - y0) / (y1 - y0)
-                alpha = float(np.clip(alpha, 0.0, 1.0))
-                info["fallback_reason"] = "window_sustained_interpolated"
-                return float(t0 + alpha * (t1 - t0))
-            info["fallback_reason"] = "window_sustained_no_slope"
-            return float(times[s])
-
-    # Last resort (only if always_return=True): take strongest post-baseline drop point
-    if always_return:
-        post = corr_s[j0:]
-        if post.size > 1:
-            jm = int(np.argmin(np.diff(post))) + 1
-            t_guess = float(times[j0 + jm])
-            info["fallback_reason"] = "best_guess_strongest_drop"
-            return t_guess
-
-    info["fallback_reason"] = "no_window_drop_found"
-    return float("nan")
-
-# --------------------------------- Main ------------------------------------- #
-
-def pattern_major_fault_time_debug(signal_view) -> Tuple[float, Dict[str, Any]]:
-    info: Dict[str, Any] = {}
-    x, y = _as_numpy_xy(signal_view)
-    info["N_input"] = int(x.size)
-    if x.size < 64:
-        info["reason"] = "too_few_points"
-        return float("nan"), info
-
-    tu, yu, dt = _uniform_resample(x, y)
-    info["dt"] = float(dt)
-    info["N_resampled"] = int(tu.size)
-    if not np.isfinite(dt) or tu.size < 64:
-        info["reason"] = "bad_resample"
-        return float("nan"), info
-
-    N = tu.size
-    N_learn = min(max(128, int(0.30 * N)), max(128, N // 2))
-    learn_end_time = float(tu[min(N_learn - 1, N - 1)])
-    info["N_learn"] = int(N_learn)
-    info["learn_end_time"] = learn_end_time
-
-    yL = yu[:N_learn]
-    T = _best_period(yL, dt)
-    info["T_period"] = float(T) if np.isfinite(T) else float("nan")
-    if not np.isfinite(T):
-        info["reason"] = "period_estimation_failed"
-        # fallback path (no period)
-        t_fb = _window_shape_change_time(tu, yu, learn_end_time, info, always_return=False)
-        return (t_fb, info)
-
-    spp = int(round(T / dt))
-    info["spp"] = int(spp)
-    if spp < 8 or spp > max(16, N_learn - 8):
-        info["reason"] = "spp_out_of_range"
-        t_fb = _window_shape_change_time(tu, yu, learn_end_time, info, always_return=False)
-        return (t_fb, info)
-
-    # Template
-    L = 128
-    template = _template_from_learning(yu, spp, L, learn_samples=N_learn)
-    info["template_ok"] = bool(template.size > 0)
-    if template.size == 0:
-        info["reason"] = "template_build_failed"
-        t_fb = _window_shape_change_time(tu, yu, learn_end_time, info, always_return=False)
-        return (t_fb, info)
-
-    # Correlation series
-    times, corr, hop = _correlation_series(tu, yu, spp, L, template)
-    info["n_windows"] = int(times.size)
-    info["hop"] = int(hop)
+        meanv.append(m)
+        stdv.append(s)
+        ampv.append(a)
+    times = np.asarray(times, dtype=float)
+    corr = np.asarray(corr, dtype=float)
+    meanv = np.asarray(meanv, dtype=float)
+    stdv = np.asarray(stdv, dtype=float)
+    ampv = np.asarray(ampv, dtype=float)
     if times.size == 0:
-        info["reason"] = "no_windows"
-        t_fb = _window_shape_change_time(tu, yu, learn_end_time, info, always_return=False)
-        return (t_fb, info)
+        return float("nan")
 
-    corr_s = _median_filter(corr, k=5)
+    # Baseline stats (learn region)
+    learn_end_time = tu[min(N_learn - 1, N - 1)]
     learn_mask = times <= learn_end_time
     if not np.any(learn_mask):
-        info["reason"] = "no_learn_windows_in_series"
-        t_fb = _window_shape_change_time(tu, yu, learn_end_time, info, always_return=False)
-        return (t_fb, info)
-
-    mc, sc = _robust_mean_std(corr_s[learn_mask])
-    info["mc"] = float(mc)
-    info["sc"] = float(sc)
-    if not np.isfinite(mc) or not np.isfinite(sc):
-        info["reason"] = "bad_baseline_stats"
-        t_fb = _window_shape_change_time(tu, yu, learn_end_time, info, always_return=False)
-        return (t_fb, info)
-
-    t = _first_sustained_drop_time(times, corr_s, learn_end_time, mc, sc, spp, hop, info)
-    if np.isfinite(t):
-        info["method"] = "cycle_correlation_sustained"
-        return float(t), info
-
-    # Fallback
-    t_fb = _window_shape_change_time(tu, yu, learn_end_time, info, always_return=False)
-    if np.isfinite(t_fb):
-        info["method"] = "window_fallback"
-        return float(t_fb), info
-
-    info["method"] = "failed_all"
-    return float("nan"), info
-
-def pattern_major_fault_time(signal_view) -> float:
-    t, _ = pattern_major_fault_time_debug(signal_view)
-    return float(t)
-
-def pattern_major_fault_time_always(signal_view) -> float:
-    # Same as debug, but window fallback will always return something (best guess)
-    info: Dict[str, Any] = {}
-    x, y = _as_numpy_xy(signal_view)
-    if x.size < 64:
-        return float("nan")
-    tu, yu, dt = _uniform_resample(x, y)
-    if not np.isfinite(dt) or tu.size < 64:
         return float("nan")
 
-    N = tu.size
-    N_learn = min(max(128, int(0.30 * N)), max(128, N // 2))
-    learn_end_time = float(tu[min(N_learn - 1, N - 1)])
+    mc, sc = _robust_mean_std(corr[learn_mask])
+    mm, sm = _robust_mean_std(meanv[learn_mask])
+    ms, ss = _robust_mean_std(stdv[learn_mask])
+    ma, sa = _robust_mean_std(ampv[learn_mask])
+    if not all(np.isfinite(v) for v in (mc, sc, mm, sm, ms, ss, ma, sa)):
+        return float("nan")
 
-    yL = yu[:N_learn]
-    T = _best_period(yL, dt)
-    if np.isfinite(T):
-        spp = int(round(T / dt))
-        if 8 <= spp <= max(16, N_learn - 8):
-            L = 128
-            template = _template_from_learning(yu, spp, L, learn_samples=N_learn)
-            if template.size > 0:
-                times, corr, hop = _correlation_series(tu, yu, spp, L, template)
-                if times.size > 0:
-                    corr_s = _median_filter(corr, k=5)
-                    learn_mask = times <= learn_end_time
-                    if np.any(learn_mask):
-                        mc, sc = _robust_mean_std(corr_s[learn_mask])
-                        if np.isfinite(mc) and np.isfinite(sc):
-                            # try sustained drop
-                            t = _first_sustained_drop_time(times, corr_s, learn_end_time, mc, sc, spp, hop, info)
-                            if np.isfinite(t):
-                                return float(t)
-                            # best guess: strongest drop after baseline
-                            j0 = int(np.searchsorted(times, learn_end_time, side="right"))
-                            post = corr_s[j0:]
-                            if post.size > 1:
-                                jm = int(np.argmin(np.diff(post))) + 1
-                                return float(times[j0 + jm])
-    # final fallback: window method with always_return=True
-    t_fb = _window_shape_change_time(tu, yu, learn_end_time, info, always_return=True)
-    return float(t_fb)
+    # Detector A: correlation drop (shape change), sustained
+    # Strict threshold to ignore minute changes
+    corr_thr = min(mc - 4.5 * sc, 0.45)
+    # Slightly shorter sustain to reduce latency while keeping robustness
+    hold_windows = max(3, int(round(0.3 * spp / hop)))  # ~30% of a period sustained
 
-__all__ = [
-    "pattern_major_fault_time",
-    "pattern_major_fault_time_always",
-    "pattern_major_fault_time_debug",
-]
+    j0 = int(np.searchsorted(times, learn_end_time, side="right"))
+    bad_corr = corr < corr_thr
+
+    tA = float("nan")
+    run = 0
+    jA_start = None
+    for j in range(j0, times.size):
+        if bad_corr[j]:
+            run += 1
+            if run >= hold_windows:
+                jA_start = j - hold_windows + 1
+                # Linear interpolate the first threshold crossing between the last good and first bad
+                k = jA_start - 1
+                if k >= j0 and np.isfinite(corr[k]):
+                    y1, t1 = corr[k], times[k]
+                    y2, t2 = corr[jA_start], times[jA_start]
+                    if y2 != y1:
+                        alpha = (corr_thr - y1) / (y2 - y1)
+                        alpha = float(np.clip(alpha, 0.0, 1.0))
+                        tA = t1 + alpha * (t2 - t1)
+                    else:
+                        tA = times[jA_start]
+                else:
+                    tA = times[jA_start]
+                break
+        else:
+            run = 0
+
+    # Detector B: CUSUM on window mean (level shift)
+    # Keeping conservative thresholds; reduce h_sigma slightly for earlier trigger.
+    tB = _cusum_first_time(meanv, times, mm, sm, k_sigma=0.5, h_sigma=7.0, start_idx=j0)
+
+    # Detector C: CUSUM on window amplitude (pulse height/width changes)
+    tC = _cusum_first_time(ampv, times, ma, sa, k_sigma=0.5, h_sigma=7.0, start_idx=j0)
+
+    # Choose earliest valid time
+    candidates = [t for t in (tA, tB, tC) if np.isfinite(t)]
+    if not candidates:
+        return float("nan")
+    return float(min(candidates))
+
+__all__ = ["pattern_change_time_robust"]
