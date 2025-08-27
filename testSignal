@@ -1,27 +1,27 @@
 """
-Detect the timestamp of a MAJOR disturbance in a repeating signal pattern (shape-only).
+Detect the timestamp of a MAJOR disturbance in a repeating signal pattern (shape-only) with robust fallbacks.
 
-Goal
-- Detect the earliest time where the waveform's repeating SHAPE changes.
-- Ignore minute changes in offset and amplitude (z-normalized comparisons).
-- Robust to small timing jitter (phase-invariant correlation).
-- Return a single timestamp (float seconds) or float("nan") if not detected.
+Why this should fix your NaN:
+- If period estimation or cycle segmentation fails, it falls back to a windowed,
+  template-free shape detector (no explicit period needed).
+- Ignores minute offset and amplitude changes by z-normalizing windows.
+- Uses phase-invariant correlation to handle small timing jitter.
+- Returns sub-sample time via interpolation when possible.
+- Still triggers only on significant, sustained changes (not tiny blips).
 
-How it works
-1) Uniformly resample the signal.
-2) Estimate the dominant period T (FFT + ACF fallback).
-3) Segment the signal into cycles using peak picking with a minimum spacing ~ T.
-4) Learn a shape-only template from an automatically selected stable set
-   of the earliest cycles (high mutual correlation).
-5) Score each subsequent cycle by phase-invariant, offset/scale-invariant correlation.
-6) Find the first cycle whose correlation falls below a strict threshold (>=5σ drop and <0.45).
-7) Refine the timestamp within that cycle:
-   - Align the changed cycle to the template.
-   - Slide a short window (~1/6 period) and find the earliest window where
-     local shape-correlation drops below 0.55 for a few consecutive steps.
-   - Return that sub-cycle time; if refinement fails, return the cycle start time.
+Public API (drop-in):
+- pattern_major_fault_time(signal_view) -> float
+  signal_view: object with .x (timestamps) and .y (values), or a tuple (x, y)
+  returns: first timestamp (seconds) of a major pattern disturbance, or float("nan")
 
-No user-tunable parameters are exposed.
+Internal policy (no user tuning):
+- Learn baseline from first ~30% (capped at half).
+- Primary: cycle-based, shape-only correlation vs learned template (>=5σ drop and <0.45),
+  sustained for ~50% of a period.
+- Fallback A (no period required): windowed shape-only correlation vs learned window-template,
+  sustained for ~30% of window length.
+- Fallback B: if still nothing, pick the strongest post-baseline correlation drop if
+  it is both large in absolute terms (>=0.25) and relative (>=3σ).
 """
 
 from typing import Tuple, List
@@ -84,6 +84,34 @@ def _median_filter(v: np.ndarray, k: int = 5) -> np.ndarray:
         out[i] = np.median(pad[i:i+k])
     return out
 
+def _first_sustained_crossing_time(times: np.ndarray, series: np.ndarray, threshold: float, hold_windows: int, start_idx: int) -> float:
+    """
+    First time where series stays below threshold for hold_windows consecutive steps.
+    Interpolates the crossing at the start of the sustained run.
+    """
+    below = series < threshold
+    run = 0
+    for j in range(start_idx, series.size):
+        if below[j]:
+            run += 1
+            if run >= hold_windows:
+                s = j - hold_windows + 1
+                k = s - 1
+                while k >= 0 and below[k]:
+                    k -= 1
+                if k < 0:
+                    return float(times[s])
+                y0, y1 = float(series[k]), float(series[k + 1])
+                t0, t1 = float(times[k]), float(times[k + 1])
+                if y1 == y0 or t1 == t0:
+                    return float(times[s])
+                alpha = (threshold - y0) / (y1 - y0)
+                alpha = float(np.clip(alpha, 0.0, 1.0))
+                return float(t0 + alpha * (t1 - t0))
+        else:
+            run = 0
+    return float("nan")
+
 # ---------------------------- Period estimation ----------------------------- #
 
 def _estimate_period_fft(y: np.ndarray, dt: float) -> float:
@@ -138,14 +166,12 @@ def _best_period(y: np.ndarray, dt: float) -> float:
 # ----------------------------- Peak detection ------------------------------- #
 
 def _find_local_maxima(y: np.ndarray) -> np.ndarray:
-    # Simple local maxima (strict), handle flat-tops by picking the first flat index
     n = y.size
     if n < 3:
         return np.empty(0, dtype=int)
     dy1 = y[1:-1] - y[:-2]
     dy2 = y[2:] - y[1:-1]
     candidates = np.where((dy1 > 0) & (dy2 <= 0))[0] + 1
-    # Include flat tops: where dy1 > 0 and dy2 == 0 for runs -> keep first index
     flats = np.where((dy1 > 0) & (dy2 == 0))[0] + 1
     if flats.size:
         candidates = np.unique(np.concatenate([candidates, flats]))
@@ -154,8 +180,7 @@ def _find_local_maxima(y: np.ndarray) -> np.ndarray:
 def _enforce_min_distance(peaks: np.ndarray, y: np.ndarray, min_dist: int) -> np.ndarray:
     if peaks.size == 0:
         return peaks
-    # Greedy keep the tallest within windows
-    order = np.argsort(-y[peaks])  # descending by height
+    order = np.argsort(-y[peaks])  # tallest first
     picked = []
     taken = np.zeros(y.size, dtype=bool)
     for idx in order:
@@ -170,7 +195,6 @@ def _enforce_min_distance(peaks: np.ndarray, y: np.ndarray, min_dist: int) -> np
     return np.asarray(picked, dtype=int)
 
 def _choose_peak_polarity(y: np.ndarray, min_dist: int) -> np.ndarray:
-    # Try maxima and minima; pick the set with more regular spacing (lower gap MAD)
     peaks_max = _enforce_min_distance(_find_local_maxima(y), y, min_dist)
     peaks_min = _enforce_min_distance(_find_local_maxima(-y), -y, min_dist)
     def score(peaks):
@@ -188,8 +212,7 @@ def _choose_peak_polarity(y: np.ndarray, min_dist: int) -> np.ndarray:
 
 # --------------------------- Template construction -------------------------- #
 
-def _cycle_segments(tu: np.ndarray, yu: np.ndarray, peaks: np.ndarray) -> List[Tuple[int, int]]:
-    # Boundaries at midpoints between successive peaks
+def _cycle_segments(yu: np.ndarray, peaks: np.ndarray) -> List[Tuple[int, int]]:
     if peaks.size < 3:
         return []
     mids = ((peaks[:-1] + peaks[1:]) // 2).astype(int)
@@ -212,12 +235,10 @@ def _resample_unit(seg: np.ndarray, L: int) -> np.ndarray:
     return np.interp(np.linspace(0, 1, L, endpoint=False), xi, z)
 
 def _phase_invariant_corr(a: np.ndarray, b: np.ndarray) -> float:
-    # a, b are unit-length vectors in same length space (not necessarily unit-norm yet)
     if a.size != b.size:
         L = max(a.size, b.size)
         a = np.interp(np.linspace(0, 1, L, endpoint=False), np.linspace(0, 1, a.size, endpoint=False), a)
         b = np.interp(np.linspace(0, 1, L, endpoint=False), np.linspace(0, 1, b.size, endpoint=False), b)
-    # unit norm
     na = float(np.linalg.norm(a)); nb = float(np.linalg.norm(b))
     if na == 0 or nb == 0:
         return 0.0
@@ -226,50 +247,39 @@ def _phase_invariant_corr(a: np.ndarray, b: np.ndarray) -> float:
     c = np.clip(c, -1.0, 1.0)
     return float(np.max(c))
 
-def _pick_stable_training_cycles(cycles: List[np.ndarray], max_train: int = 12, L: int = 128) -> List[int]:
-    # Build z-normalized, resampled cycles
-    Z = [ _resample_unit(c, L) for c in cycles[:max(20, max_train)] ]  # consider up to first 20 cycles
-    if len(Z) < 4:
-        return list(range(min(len(Z), max_train)))
+def _build_template_from_cycles(cycles: List[np.ndarray], max_train: int = 12, L: int = 128) -> Tuple[np.ndarray, List[int]]:
+    if len(cycles) == 0:
+        return np.array([], dtype=float), []
+    Z = [ _resample_unit(c, L) for c in cycles[:max(24, max_train)] ]
     M = len(Z)
+    if M < 4:
+        # average what we have
+        acc = np.sum(Z, axis=0)
+        tpl = acc / max(1, len(Z))
+        n = float(np.linalg.norm(tpl))
+        if n > 0:
+            tpl = tpl / n
+        return tpl, list(range(len(Z)))
     # Correlation matrix
-    C = np.zeros((M, M), dtype=float)
+    C = np.eye(M, dtype=float)
     for i in range(M):
-        C[i, i] = 1.0
         for j in range(i+1, M):
             cij = _phase_invariant_corr(Z[i], Z[j])
             C[i, j] = C[j, i] = cij
-    # Choose center cycle with highest mean corr
     mean_corr = np.mean(C, axis=1)
     center = int(np.argmax(mean_corr))
-    # Rank other cycles by correlation to center
+    # Rank by similarity to center
     order = np.argsort(-C[center])
-    # Keep top cycles with corr close to center's distribution
-    selected = []
     base = C[center, order]
     med, sig = _robust_mean_std(base)
-    thr = max(0.85, med - 2.0 * sig)  # require fairly high similarity
-    for idx in order:
-        if C[center, idx] >= thr:
-            selected.append(idx)
-        if len(selected) >= max_train:
-            break
+    thr = max(0.85, med - 2.0 * sig)
+    selected = [idx for idx in order if C[center, idx] >= thr][:max_train]
     selected.sort()
-    return selected
-
-def _build_template_from_cycles(cycles: List[np.ndarray], idxs: List[int], L: int = 128) -> np.ndarray:
-    if not idxs:
-        return np.array([], dtype=float)
-    acc = np.zeros(L, dtype=float)
-    cnt = 0
-    for k in idxs:
-        z = _resample_unit(cycles[k], L)
-        acc += z; cnt += 1
-    tpl = acc / max(1, cnt)
+    tpl = np.mean([Z[k] for k in selected], axis=0)
     n = float(np.linalg.norm(tpl))
     if n > 0:
         tpl = tpl / n
-    return tpl
+    return tpl, selected
 
 # ---------------------------- Local refine inside cycle --------------------- #
 
@@ -277,19 +287,14 @@ def _refine_within_cycle_time(tu: np.ndarray, yu: np.ndarray, seg_bounds: Tuple[
     s, e = seg_bounds
     seg = yu[s:e]
     L = template.size
-    # Align the cycle to template (phase-invariant)
     z = _resample_unit(seg, L)
-    # Find best circular shift to align
+    # Best circular shift to align
     c = np.fft.ifft(np.fft.fft(z) * np.conj(np.fft.fft(template))).real
     shift = int(np.argmax(c)) % L
-    # Apply shift to the original (unresampled) segment by mapping indices
-    # We'll operate in the resampled domain to locate the change, then map to time.
-    # Sliding window correlation against template, using short window (~1/6 period)
+    tpl = np.roll(template, -shift)
+    # Short window scan ~1/6 period
     w = max(8, L // 6)
-    hold = max(3, w // 6)  # require a few consecutive dips
-    # Precompute template windows norms
-    tpl = np.roll(template, -shift)  # template aligned to z
-    # rolling windows
+    hold = max(3, w // 6)
     bad = []
     for i in range(0, L - w + 1):
         win = z[i:i+w]
@@ -298,7 +303,6 @@ def _refine_within_cycle_time(tu: np.ndarray, yu: np.ndarray, seg_bounds: Tuple[
         corr = float(np.dot(win, twn) / (n1 * n2)) if (n1 > 0 and n2 > 0) else 0.0
         bad.append(corr < 0.55)
     bad = np.asarray(bad, dtype=bool)
-    # first sustained run
     run = 0
     pos = None
     for i, b in enumerate(bad):
@@ -310,13 +314,95 @@ def _refine_within_cycle_time(tu: np.ndarray, yu: np.ndarray, seg_bounds: Tuple[
         else:
             run = 0
     if pos is None:
-        # fallback: use cycle start
         return float(tu[s])
-    # Map resampled index to original time
     alpha = (pos / max(1, L - 1))
-    t0 = float(tu[s])
-    t1 = float(tu[e-1])
+    t0 = float(tu[s]); t1 = float(tu[e-1])
     return float(t0 + alpha * (t1 - t0))
+
+# ---------------------------- Windowed fallback (no T) ---------------------- #
+
+def _window_shape_change_time(tu: np.ndarray, yu: np.ndarray, learn_end_time: float) -> float:
+    """
+    Fallback: detect shape change without knowing the period.
+    - Build a shape-only template from baseline windows (first ~30% of record).
+    - Slide windows over the full signal and compute phase-invariant correlation.
+    - Trigger on a large, sustained drop.
+    """
+    N = tu.size
+    if N < 128:
+        return float("nan")
+
+    # Choose a window ~ N/20 (5% of the record), clipped
+    W = int(np.clip(N // 20, 64, N // 6))
+    hop = max(1, W // 4)
+    L = 128  # template length
+
+    # Build baseline windows ending before learn_end_time
+    times = []
+    corr = []
+    windows = []
+    win_times = []
+    for i in range(0, N - W, hop):
+        seg = yu[i:i+W]
+        z = _resample_unit(seg, L)
+        windows.append(z)
+        win_times.append(tu[i + W // 2])
+    windows = np.asarray(windows, dtype=float)
+    win_times = np.asarray(win_times, dtype=float)
+    if windows.shape[0] < 8:
+        return float("nan")
+
+    base_mask = win_times <= learn_end_time
+    if not np.any(base_mask):
+        return float("nan")
+    Zb = windows[base_mask]
+    tpl = np.mean(Zb, axis=0)
+    n = float(np.linalg.norm(tpl))
+    if n > 0:
+        tpl = tpl / n
+    else:
+        return float("nan")
+
+    # Score all windows
+    for k in range(windows.shape[0]):
+        c = _phase_invariant_corr(windows[k], tpl)
+        corr.append(c)
+        times.append(win_times[k])
+    corr = np.asarray(corr, dtype=float)
+    times = np.asarray(times, dtype=float)
+
+    # Smooth lightly
+    corr_s = _median_filter(corr, k=5)
+
+    # Baseline stats
+    mc, sc = _robust_mean_std(corr_s[base_mask])
+    if not np.isfinite(mc) or not np.isfinite(sc):
+        return float("nan")
+    thr = min(mc - 4.0 * sc, 0.50)  # a bit less strict than cycle method
+
+    # Sustained drop ~30% of window
+    hold_windows = max(2, int(round(0.30 * (W / hop))))
+    j0 = int(np.searchsorted(times, learn_end_time, side="right"))
+    tA = _first_sustained_crossing_time(times, corr_s, thr, hold_windows, j0)
+    if np.isfinite(tA):
+        return float(tA)
+
+    # Final resort: largest drop point post-baseline if it's clearly significant
+    post_mask = np.arange(times.size) >= j0
+    if not np.any(post_mask):
+        return float("nan")
+    post_corr = corr_s[post_mask]
+    post_times = times[post_mask]
+    if post_corr.size < 3:
+        return float("nan")
+    # Find minimum correlation after baseline
+    jmin = int(np.argmin(post_corr))
+    cmin = float(post_corr[jmin])
+    drop_abs = float(mc - cmin)
+    z_drop = drop_abs / max(sc, 1e-12)
+    if drop_abs >= 0.25 and z_drop >= 3.0:
+        return float(post_times[jmin])
+    return float("nan")
 
 # --------------------------------- Main ------------------------------------- #
 
@@ -330,89 +416,69 @@ def pattern_major_fault_time(signal_view) -> float:
     if not np.isfinite(dt) or tu.size < 256:
         return float("nan")
 
-    # 2) Period estimate on early region
+    # 2) Learn region
     learn_fraction = 0.30
     N = tu.size
     N_learn = min(max(256, int(N * learn_fraction)), max(256, N // 2))
+    learn_end_time = float(tu[min(N_learn - 1, N - 1)])
     yL = yu[:N_learn]
+
+    # 3) Try cycle-based method first
     T = _best_period(yL, dt)
-    if not np.isfinite(T):
-        return float("nan")
-    spp = int(round(T / dt))
-    if spp < 12:
-        return float("nan")
+    detected_times: List[float] = []
 
-    # 3) Peaks and cycles
-    min_dist = max(4, int(round(0.4 * spp)))
-    peaks = _choose_peak_polarity(yu, min_dist)
-    if peaks.size < 6:
+    if np.isfinite(T):
+        spp = int(round(T / dt))
+        if 12 <= spp <= max(16, N_learn // 2):
+            min_dist = max(4, int(round(0.4 * spp)))
+            peaks = _choose_peak_polarity(yu, min_dist)
+            if peaks.size >= 6:
+                segs = _cycle_segments(yu, peaks)
+                if len(segs) >= 6:
+                    cycles = [ yu[s:e] for (s, e) in segs ]
+                    template, train_idxs = _build_template_from_cycles(cycles, max_train=12, L=128)
+                    if template.size > 0 and len(train_idxs) >= 3:
+                        # Score cycles
+                        Ltpl = template.size
+                        cycle_corr = []
+                        for (s, e) in segs:
+                            z = _resample_unit(yu[s:e], Ltpl)
+                            cycle_corr.append(_phase_invariant_corr(z, template))
+                        cycle_corr = np.asarray(cycle_corr, dtype=float)
+
+                        base_corr = cycle_corr[train_idxs]
+                        mc, sc = _robust_mean_std(base_corr)
+                        if np.isfinite(mc) and np.isfinite(sc):
+                            corr_thr = min(mc - 5.0 * sc, 0.45)
+                            # Smooth a bit
+                            corr_s = _median_filter(cycle_corr, k=3)
+                            # Require two consecutive bad cycles for robustness
+                            bad = corr_s < corr_thr
+                            run = 0
+                            j_star = None
+                            last_train = max(train_idxs)
+                            start_idx = last_train + 1
+                            for j in range(start_idx, len(segs)):
+                                if bad[j]:
+                                    run += 1
+                                    if run >= 2:
+                                        j_star = j - 1
+                                        break
+                                else:
+                                    run = 0
+                            if j_star is not None:
+                                t_refined = _refine_within_cycle_time(tu, yu, segs[j_star], template)
+                                detected_times.append(float(t_refined))
+
+    # 4) If cycle-based failed, use windowed fallback (no period needed)
+    if not detected_times:
+        t_fb = _window_shape_change_time(tu, yu, learn_end_time)
+        if np.isfinite(t_fb):
+            detected_times.append(float(t_fb))
+
+    # 5) Return earliest detected time or NaN
+    if not detected_times:
         return float("nan")
-    segs = _cycle_segments(tu, yu, peaks)
-    if len(segs) < 6:
-        return float("nan")
-
-    # 4) Build cycles array and choose stable training set
-    cycles = [ yu[s:e] for (s, e) in segs ]
-    train_idxs = _pick_stable_training_cycles(cycles, max_train=12, L=128)
-    if not train_idxs:
-        return float("nan")
-    # Ensure training cycles end before or near learn window
-    # If many cycles start after learn window, trim to earliest ones
-    cutoff_time = tu[min(N_learn - 1, N - 1)]
-    trimmed = [k for k in train_idxs if segs[k][1] <= np.searchsorted(tu, cutoff_time, side="right")]
-    if len(trimmed) >= max(4, len(train_idxs)//2):
-        train_idxs = trimmed
-
-    template = _build_template_from_cycles(cycles, train_idxs, L=128)
-    if template.size == 0:
-        return float("nan")
-
-    # 5) Score cycles by shape-only, phase-invariant correlation
-    Ltpl = template.size
-    cycle_corr = []
-    cycle_time = []
-    for (s, e) in segs:
-        z = _resample_unit(yu[s:e], Ltpl)
-        c = _phase_invariant_corr(z, template)
-        cycle_corr.append(c)
-        cycle_time.append(tu[s])  # start time of cycle
-    cycle_corr = np.asarray(cycle_corr, dtype=float)
-    cycle_time = np.asarray(cycle_time, dtype=float)
-
-    # 6) Baseline stats from training cycles
-    base_corr = cycle_corr[train_idxs]
-    mc, sc = _robust_mean_std(base_corr)
-    if not np.isfinite(mc) or not np.isfinite(sc):
-        return float("nan")
-    # Threshold: strong drop and low absolute corr
-    corr_thr = min(mc - 5.0 * sc, 0.45)
-
-    # 7) Find first anomalous cycle after the training region
-    last_train = max(train_idxs)
-    start_idx = last_train + 1
-    if start_idx >= len(segs):
-        return float("nan")
-
-    # Smooth cycle correlations a bit to avoid minute blips
-    corr_s = _median_filter(cycle_corr, k=3)
-    bad = corr_s < corr_thr
-
-    # Require at least 2 consecutive bad cycles to be robust
-    run = 0
-    j_star = None
-    for j in range(start_idx, len(segs)):
-        if bad[j]:
-            run += 1
-            if run >= 2:
-                j_star = j - 1  # mark from the first bad in the run
-                break
-        else:
-            run = 0
-    if j_star is None:
-        return float("nan")
-
-    # 8) Refine timestamp within the first anomalous cycle
-    t_refined = _refine_within_cycle_time(tu, yu, segs[j_star], template)
-    return float(t_refined)
+    return float(min(detected_times))
 
 __all__ = ["pattern_major_fault_time"]
