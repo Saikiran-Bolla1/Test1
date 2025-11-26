@@ -1,0 +1,150 @@
+def pattern_major_fault_time(signal_view) -> float:
+    """
+    Return the first timestamp (float seconds) where a MAJOR disturbance occurs.
+    - Assumes roughly 5 ms sample interval, tolerates ±0.2 ms jitter.
+    - Interpolates to a uniform grid for internal processing.
+    - Learns template from first 30% of the signal.
+    - Returns float('nan') if no major disturbance is found.
+    """
+    import numpy as np
+
+    # --- Helper: convert to numpy arrays, ensure ascending time ---
+    def _as_numpy_xy(sv):
+        if isinstance(sv, tuple) and len(sv) == 2:
+            x = np.asarray(sv[0], dtype=float)
+            y = np.asarray(sv[1], dtype=float)
+        else:
+            x = np.asarray(sv.x, dtype=float)
+            y = np.asarray(sv.y, dtype=float)
+        # Sort by ascending time
+        if x.size > 1 and not np.all(np.diff(x) >= 0):
+            idx = np.argsort(x)
+            x, y = x[idx], y[idx]
+        return x, y
+
+    x, y = _as_numpy_xy(signal_view)
+    if x.size < 256:
+        return float("nan")
+
+    # --- Estimate sample period robustly (median with tolerance) ---
+    nominal_dt = 0.005  # 5 ms
+    dt_est = float(np.median(np.diff(x)))
+    if not (nominal_dt - 0.0002 <= dt_est <= nominal_dt + 0.0002):
+        # Warn if data is not roughly 5 ms, but continue
+        pass
+
+    dt = nominal_dt  # Target uniform grid (analysis happens on regular grid)
+    tu = np.arange(x[0], x[-1] + 0.5 * dt, dt)
+    yu = np.interp(tu, x, y)
+    if tu.size < 256:
+        return float("nan")
+
+    # --- Learn region: first 30% of signal ---
+    learn_fraction = 0.30
+    N = tu.size
+    N_learn = max(256, int(N * learn_fraction))
+    yL = yu[:N_learn]
+    learn_end_time = tu[min(N_learn - 1, N - 1)]
+
+    # --- Period estimate from learn region ---
+    def _best_period(y, dt):
+        N = y.size
+        z = y - y.mean()
+        f = np.fft.rfftfreq(N, dt)
+        mag = abs(np.fft.rfft(z))
+        mag[0] = 0
+        idx = np.argmax(mag[1:]) + 1
+        if f[idx] == 0:
+            return np.nan
+        return 1.0 / f[idx]
+    T = _best_period(yL, dt)
+    if not np.isfinite(T):
+        return float("nan")
+    spp = int(round(T / dt))
+    if spp < 12 or spp > N_learn // 2:
+        return float("nan")
+
+    # --- Build template from learn region ---
+    def _align_and_average(y, spp):
+        K = max(2, y.size // spp)
+        stack = []
+        for k in range(K):
+            seg = y[k * spp:(k + 1) * spp]
+            if seg.size == spp:
+                stack.append((seg - np.mean(seg)) / (np.std(seg) + 1e-8))
+        if not stack:
+            return np.array([])
+        return np.mean(stack, axis=0)
+    template = _align_and_average(yL, spp)
+    if template.size == 0:
+        return float("nan")
+
+    # --- Slide window across full signal ---
+    hop = max(1, int(round(spp / 12)))
+    times, corr, meanv, stdv, ampv = [], [], [], [], []
+    for i in range(0, N - spp, hop):
+        seg = yu[i:i + spp]
+        m, s, a = float(np.mean(seg)), float(np.std(seg)), float(np.ptp(seg))
+        norm_seg = (seg - m) / (s + 1e-8)
+        c = np.dot(norm_seg, template) / (np.linalg.norm(norm_seg) * np.linalg.norm(template) + 1e-8)
+        times.append(tu[i + spp // 2])
+        corr.append(c)
+        meanv.append(m)
+        stdv.append(s)
+        ampv.append(a)
+    times = np.asarray(times, dtype=float)
+    corr = np.asarray(corr, dtype=float)
+    meanv = np.asarray(meanv, dtype=float)
+    stdv = np.asarray(stdv, dtype=float)
+    ampv = np.asarray(ampv, dtype=float)
+    if times.size == 0:
+        return float("nan")
+
+    # --- Stats from learn region ---
+    learn_mask = times <= learn_end_time
+    mc = np.median(corr[learn_mask])
+    sc = 1.4826 * np.median(abs(corr[learn_mask] - mc))
+    mm = np.median(meanv[learn_mask])
+    sm = 1.4826 * np.median(abs(meanv[learn_mask] - mm))
+    ms = np.median(stdv[learn_mask])
+    ss = 1.4826 * np.median(abs(stdv[learn_mask] - ms))
+    ma = np.median(ampv[learn_mask])
+    sa = 1.4826 * np.median(abs(ampv[learn_mask] - ma))
+
+    # --- Detector A: sustained correlation drop ---
+    c_thr = min(mc - 4.0 * sc, 0.55)
+    hold_windows = max(3, int(round(0.35 * spp / hop)))
+    j0 = int(np.searchsorted(times, learn_end_time, side="right"))
+    bad = corr < c_thr
+    tA = float("nan")
+    run = 0
+    for j in range(j0, times.size):
+        if bad[j]:
+            run += 1
+            if run >= hold_windows:
+                j_start = j - hold_windows + 1
+                tA = times[j_start]
+                break
+        else:
+            run = 0
+
+    # --- Detector B: feature sigma test ---
+    z_mean = np.abs(meanv - mm) / max(sm, 1e-12)
+    z_std  = np.abs(stdv - ms)  / max(ss, 1e-12)
+    z_amp  = np.abs(ampv - ma)  / max(sa, 1e-12)
+    major_feat = ((z_mean > 6.0).astype(int) + (z_std > 6.0).astype(int) + (z_amp > 6.0).astype(int)) >= 2
+    tB = float("nan")
+    run = 0
+    for j in range(j0, times.size):
+        if major_feat[j]:
+            run += 1
+            if run >= hold_windows:
+                tB = times[j - hold_windows + 1]
+                break
+        else:
+            run = 0
+
+    candidates = [t for t in (tA, tB) if np.isfinite(t)]
+    if not candidates:
+        return float("nan")
+    return max(min(candidates), learn_end_time)
