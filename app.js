@@ -8,7 +8,7 @@ function formatTime(ts, mode) {
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' ' + d.toLocaleDateString();
   }
   if (typeof ts === "number") {
-    return ts.toFixed(2);
+    return ts.toFixed(3);
   }
   return ts;
 }
@@ -316,7 +316,7 @@ createApp({
         xVal.textContent = chartCursorX.value[chartIdx];
         legend.forEach((sig, i) => {
           let v = data[i + 1][idx];
-          const txt = (typeof v === "number") ? v.toLocaleString(undefined, { maximumFractionDigits: 3 }) : "--";
+          const txt = (typeof v === "number") ? v.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 }) : "--";
           chartCursorValues.value[chartIdx][sig] = txt;
           items[i].val.textContent = txt;
         });
