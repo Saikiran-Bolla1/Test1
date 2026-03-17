@@ -1,8 +1,12 @@
 import os
+import time
 from datetime import datetime
 from TestPackage.report.export.exporter import export_report_with_assets, fill_stats, append_incremental_info
 from TestPackage.config.config_manager import ConfigManager
 from TestPackage.env_info import build_test_env
+
+# OPTIMIZATION: Global cache for test data to avoid re-reading from disk
+_test_data_cache = {}
 
 # Global variables for managing test suite state and reporting
 _completed_tests = []
@@ -14,12 +18,14 @@ _current_test_report_path = None
 _test_env = None
 _last_test_report = None
 
+
 def set_test_env(env=None):
     """Set the test environment dynamically from the configuration."""
     global _test_env
     if _test_env is None:
         _test_env = build_test_env(user_env=env)
     print(f"[DEBUG] Test environment initialized: {_test_env}")
+
 
 def get_test_env():
     """Retrieve the global test environment."""
@@ -30,6 +36,7 @@ def get_test_env():
     print(f"[DEBUG] Test environment fetched: {_test_env}")
     return _test_env
 
+
 def set_report_output_dir(path):
     """Set the directory for report output."""
     global _report_output_dir
@@ -38,10 +45,12 @@ def set_report_output_dir(path):
     _report_output_dir = path
     print(f"[DEBUG] Report output directory set to: {_report_output_dir}")
 
+
 def start_suite():
     """Initialize the test suite and set up the environment."""
-    global _suite_start_time, _report_output_dir
+    global _suite_start_time, _report_output_dir, _test_data_cache
     _suite_start_time = datetime.now()
+    _test_data_cache.clear()  # Clear cache at suite start
     print(f"[DEBUG] Suite start time: {_suite_start_time}")
 
     from TestPackage.Test.runner import resolve_path
@@ -53,11 +62,13 @@ def start_suite():
     set_test_env()
     print(f"[DEBUG] Test environment during suite initialization: {_test_env}")
 
+
 def end_suite():
     """Finalize the test suite."""
     global _suite_end_time
     _suite_end_time = datetime.now()
     print(f"[DEBUG] Suite end time: {_suite_end_time}")
+
 
 def start_test(test_name=None):
     """Initialize a test case."""
@@ -87,6 +98,7 @@ def start_test(test_name=None):
     _current_test_report_path = os.path.join(_report_output_dir, folder_name, "tests", test_name, "testResults")
     print(f"[DEBUG] Current test report path set to: {_current_test_report_path}")
 
+
 def get_test_report_path(test_name=None):
     """Retrieve the path to the test report folder for a specific test case."""
     global _report_output_dir, _current_test_name
@@ -110,6 +122,7 @@ def get_test_report_path(test_name=None):
     print(f"[DEBUG] Test report path constructed: {test_report_path}")
     return test_report_path
 
+
 def get_current_test_status():
     """Retrieve the status of the currently executing test case."""
     global _current_test_name
@@ -128,9 +141,15 @@ def get_current_test_status():
 
     raise RuntimeError(f"[ERROR] Test case '{_current_test_name}' not found in completed tests.")
 
+
 def notify_test_complete(test_report):
-    """Notify that a test case has been completed and update the report."""
-    global _completed_tests, _report_output_dir, _suite_start_time, _last_test_report
+    """
+    Notify that a test case has been completed and update the report.
+
+    OPTIMIZATION: Caches test data in memory and defers statistics calculation
+    until suite export to avoid repeated file I/O and recalculation.
+    """
+    global _completed_tests, _report_output_dir, _suite_start_time, _last_test_report, _test_data_cache
 
     if not hasattr(test_report, "to_dict"):
         raise TypeError("[ERROR] Test report must have a 'to_dict()' method.")
@@ -153,38 +172,56 @@ def notify_test_complete(test_report):
     _completed_tests.append(test_report_dict)
     _last_test_report = test_report
 
-    # Resolve the `dut` argument for append_incremental_info
+    # OPTIMIZATION: Cache test data in memory
+    sanitized_name = test_report_dict["name"].replace(" ", "_")
+    _test_data_cache[sanitized_name] = test_report_dict
+
+    # Resolve the `dut` argument
     dut = test_report_dict.get("dut", {})
 
+    # OPTIMIZATION: Skip stats update during incremental reporting
+    # Stats will be recalculated once during export_suite_report()
+    start_time = time.time()
     append_incremental_info(
         report_dir=report_dir,
         test_name=test_report_dict["name"],
         tc=test_report_dict,
         test_env=get_test_env(),
-        dut=dut,  # Pass the resolved `dut` argument
+        dut=dut,
         project_name=ConfigManager().get("project"),
         suite_name="Test Report",
         suite_start_time=_suite_start_time,
-        suite_end_time=_suite_end_time or datetime.now()
+        suite_end_time=_suite_end_time or datetime.now(),
+        cached_test_data=_test_data_cache,
+        skip_stats_update=True  # OPTIMIZATION: Defer stats calculation
     )
+    elapsed = time.time() - start_time
+    print(f"[DEBUG] append_incremental_info took {elapsed:.2f}s")
+
 
 def export_suite_report():
-    """Export the final suite report."""
+    """
+    Export the final suite report.
+
+    OPTIMIZATION: Recalculates statistics once at the end instead of after every test.
+    """
     global _suite_start_time, _suite_end_time, _completed_tests, _report_output_dir
 
     if _suite_start_time is None:
-        raise RuntimeError("[ERROR] Suite start time not set. Ensure start_suite() was called before exporting the suite report.")
+        raise RuntimeError(
+            "[ERROR] Suite start time not set. Ensure start_suite() was called before exporting the suite report.")
 
     folder_name = _suite_start_time.strftime("%Y.%m.%d_%H.%M.%S")
 
-    # Resolve the `dut` argument to pass to export_report_with_assets
+    # Resolve the `dut` argument
     dut = _completed_tests[-1].get("dut", {}) if _completed_tests else {}
 
+    start_time = time.time()
     export_report_with_assets(
         output_root_dir=_report_output_dir or "output_reports",
         folder_name=folder_name,
         test_env=get_test_env(),
-        dut=dut,  # Pass the resolved `dut` argument
+        dut=dut,
         test_cases=_completed_tests.copy(),
         stats=fill_stats({}, _completed_tests, _suite_start_time, _suite_end_time or datetime.now()),
         project_name=ConfigManager().get("project"),
@@ -192,14 +229,19 @@ def export_suite_report():
         suite_start_time=_suite_start_time,
         suite_end_time=_suite_end_time or datetime.now()
     )
+    elapsed = time.time() - start_time
+    print(f"[DEBUG] export_suite_report took {elapsed:.2f}s")
+
 
 def get_current_test_name():
     """Retrieve the name of the current test case."""
     return _current_test_name
 
+
 def get_report_status():
     """Check if the report directory exists."""
     return os.path.exists(_report_output_dir) if _report_output_dir else False
+
 
 def get_report_path():
     """Retrieve the path to the latest report folder."""
@@ -208,6 +250,7 @@ def get_report_path():
     subfolders = [os.path.join(_report_output_dir, d) for d in os.listdir(_report_output_dir)
                   if os.path.isdir(os.path.join(_report_output_dir, d))]
     return max(subfolders, key=os.path.getmtime) if subfolders else None
+
 
 def get_overall_report_status():
     """Retrieve the overall status of the test suite."""
@@ -221,6 +264,7 @@ def get_overall_report_status():
     elif all(status == "NONE" for status in statuses):
         return "NONE"
     return "PARTIAL"
+
 
 def get_test_case_status(test_name):
     """Retrieve the status of a specific test case."""
